@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.tcballard.localwrap",
+  "name": "LocalWrap",
+  "version": "0.1.0",
+  "author": "Tom Ballard",
+  "license": "Apache-2.0",
+  "description": "A cockpit for local development projects: start, monitor, and open the loopback apps described by a repository's LocalWrap workspace manifest.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "LocalWrap",
+    "category": "Development",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
