@@ -177,6 +177,12 @@ checkout of this repository, `./install.sh` copies the payload into
 `~/.config/omarchy/plugins/io.github.tcballard.localwrap/` (files only, no
 symlinks; it never enables or starts anything).
 
+[`examples/demo`](examples/demo) is a dependency-free two-project workspace
+(api with a visible warmup delay, web gated on it via `dependsOn`, a
+`Full stack` workspace) for exercising every feature on a real machine —
+including orchestration, conflict refusal, and failure tails. Its README has
+a suggested walk-through.
+
 Pure logic lives in `Model.js`, shared verbatim between the QML entry points
 and the node test suite:
 
