@@ -13,9 +13,12 @@ import "Model.js" as Model
 // until the user presses Start on a reviewed row.
 //
 // External commands used, all with fixed argument lists built in Model.js:
-//   cat    read the configuration and manifest files
-//   which  confirm a manifest executable exists before launching it
-//   curl   probe the loopback health-check URL (HEAD, 1 s budget)
+//   cat          read the configuration and manifest files
+//   which        confirm a manifest executable exists before launching it
+//   test -d      confirm the project directory exists before launching
+//   curl         probe the loopback health-check URL (HEAD, 1 s budget)
+//   stat         poll config/manifest mtimes so edits are picked up
+//   notify-send  desktop notifications, only when enabled in configuration
 // Project commands themselves are restricted to the LocalWrap executable
 // allowlist and are launched directly — never through a shell.
 Panel {
@@ -35,7 +38,15 @@ Panel {
   property var activeProcesses: ({})
   property string configError: ""
   property bool configLoaded: false
+  property bool configNotifications: false
+  property bool configOpenOnReady: false
   property int loadGeneration: 0
+  // orchestrations: repoRoot + "@" + workspaceID ->
+  //   { repoRoot, workspaceId, name, plan, state, message } where state is
+  //   "running", "halted", or "done".
+  property var orchestrations: ({})
+  // Last observed config/manifest mtimes; null until the first watch poll.
+  property var watchTimes: null
 
   readonly property string homeDirectory: Quickshell.env("HOME") || ""
   readonly property string configPath:
@@ -64,6 +75,11 @@ Panel {
 
   Component.onCompleted: reload()
 
+  // Re-evaluate running workspace orchestrations whenever project state or
+  // the repository listing changes. Qt.callLater collapses bursts.
+  onRuntimesChanged: Qt.callLater(advanceOrchestrations)
+  onRepositoriesChanged: Qt.callLater(advanceOrchestrations)
+
   // -------------------------------------------------------------------------
   // Configuration and manifest loading (read-only)
   // -------------------------------------------------------------------------
@@ -74,6 +90,8 @@ Panel {
     repositories = []
     configError = ""
     configLoaded = false
+    configNotifications = false
+    configOpenOnReady = false
     if (homeDirectory === "") {
       configError = "Cannot resolve $HOME to locate the configuration."
       configLoaded = true
@@ -91,6 +109,8 @@ Panel {
         root.configError = diagnosticsText(parsed.errors)
         return
       }
+      root.configNotifications = parsed.notifications === true
+      root.configOpenOnReady = parsed.openOnReady === true
       if (parsed.repositories.length === 0) {
         root.configError = "missing-config"
         return
@@ -107,6 +127,7 @@ Panel {
           errors: [],
           warnings: [],
           projects: [],
+          workspaces: [],
           loading: true,
         })
       }
@@ -133,6 +154,7 @@ Panel {
         }],
         warnings: [],
         projects: [],
+        workspaces: [],
       })
       return
     }
@@ -157,6 +179,7 @@ Panel {
         errors: result.errors,
         warnings: result.warnings,
         projects: result.ok ? result.projects : [],
+        workspaces: result.ok ? result.workspaces : [],
       })
     })
   }
@@ -273,26 +296,37 @@ Panel {
     runRead(["which", project.command.executable], function(whichExit) {
       if (statusFor(project.key) !== Model.STATUS.starting) return
       if (whichExit !== 0) {
-        setRuntime(project.key, {
-          status: Model.STATUS.failed,
-          message: "Executable \"" + project.command.executable
-            + "\" was not found on PATH.",
-        })
+        failStart(project, "Executable \"" + project.command.executable
+          + "\" was not found on PATH.")
         return
       }
-      runRead(Model.curlProbeArgv(project.healthCheckURL), function(_probeExit, body) {
+      runRead(Model.dirCheckArgv(project.cwd), function(dirExit) {
         if (statusFor(project.key) !== Model.STATUS.starting) return
-        if (Model.isReadyHttpCode(body)) {
-          setRuntime(project.key, {
-            status: Model.STATUS.conflict,
-            message: "Something is already responding at " + project.healthCheckURL
-              + ". Not starting a second copy.",
-          })
+        if (dirExit !== 0) {
+          failStart(project, "Project directory not found: " + project.cwd)
           return
         }
-        spawnRunner(project)
+        runRead(Model.curlProbeArgv(project.healthCheckURL), function(_probeExit, body) {
+          if (statusFor(project.key) !== Model.STATUS.starting) return
+          if (Model.isReadyHttpCode(body)) {
+            var conflictMessage = "Something is already responding at "
+              + project.healthCheckURL + ". Not starting a second copy."
+            setRuntime(project.key, {
+              status: Model.STATUS.conflict,
+              message: conflictMessage,
+            })
+            notifyTransition(project.name, Model.STATUS.conflict, conflictMessage)
+            return
+          }
+          spawnRunner(project)
+        })
       })
     })
+  }
+
+  function failStart(project, message) {
+    setRuntime(project.key, { status: Model.STATUS.failed, message: message })
+    notifyTransition(project.name, Model.STATUS.failed, message)
   }
 
   function spawnRunner(project) {
@@ -304,10 +338,7 @@ Panel {
       environment: { PORT: String(project.port) },
     })
     if (runner === null) {
-      setRuntime(project.key, {
-        status: Model.STATUS.failed,
-        message: "Could not create the process object.",
-      })
+      failStart(project, "Could not create the process object.")
       return
     }
     activeProcesses[project.key] = runner
@@ -332,11 +363,13 @@ Panel {
       setRuntime(key, { status: Model.STATUS.stopped, message: "", tail: [] })
       return
     }
+    var exitMessage = "Exited unexpectedly (code " + exitCode + ")."
     setRuntime(key, {
       status: Model.STATUS.failed,
-      message: "Exited unexpectedly (code " + exitCode + ").",
+      message: exitMessage,
       tail: tail,
     })
+    notifyTransition(runtimeFor(key).name, Model.STATUS.failed, exitMessage)
   }
 
   function pollStartingProjects() {
@@ -346,11 +379,11 @@ Panel {
       var runtime = runtimes[key]
       if (runtime.status !== Model.STATUS.starting) continue
       if (Date.now() - runtime.startedAt > Model.READY_TIMEOUT_MS) {
-        setRuntime(key, {
-          status: Model.STATUS.stalled,
-          message: "Process is running but " + runtime.url + " did not respond within "
-            + Math.round(Model.READY_TIMEOUT_MS / 1000) + " s.",
-        })
+        var stallMessage = "Process is running but " + runtime.url
+          + " did not respond within "
+          + Math.round(Model.READY_TIMEOUT_MS / 1000) + " s."
+        setRuntime(key, { status: Model.STATUS.stalled, message: stallMessage })
+        notifyTransition(runtime.name, Model.STATUS.stalled, stallMessage)
         continue
       }
       if (runtime.probeInFlight) continue
@@ -366,19 +399,205 @@ Panel {
       if (root.runtimes[key] === undefined) return
       setRuntime(key, { probeInFlight: false })
       if (statusFor(key) !== Model.STATUS.starting) return
-      if (Model.isReadyHttpCode(body))
+      if (Model.isReadyHttpCode(body)) {
         setRuntime(key, { status: Model.STATUS.ready, message: "" })
+        var readyProject = projectForKey(key)
+        var readyName = readyProject !== null ? readyProject.name : runtimeFor(key).name
+        notifyTransition(readyName, Model.STATUS.ready,
+          readyProject !== null ? readyProject.url : "")
+        // Auto-open only when both the user's configuration and the
+        // project's manifest opt in.
+        if (root.configOpenOnReady && readyProject !== null && readyProject.openOnReady)
+          openProject(readyProject)
+      }
     })
   }
 
-  function probeURLFor(key) {
+  function projectForKey(key) {
     for (var i = 0; i < repositories.length; i += 1) {
       for (var j = 0; j < repositories[i].projects.length; j += 1) {
         if (repositories[i].projects[j].key === key)
-          return repositories[i].projects[j].healthCheckURL
+          return repositories[i].projects[j]
       }
     }
     return null
+  }
+
+  function probeURLFor(key) {
+    var project = projectForKey(key)
+    return project === null ? null : project.healthCheckURL
+  }
+
+  // Desktop notifications: opt-in via configuration, status transitions
+  // only, never command output.
+  function notifyTransition(name, status, detail) {
+    if (!configNotifications) return
+    var note = Model.notificationForTransition(name, status, detail)
+    if (note === null) return
+    runRead(Model.notifySendArgv(note.summary, note.body), function() {})
+  }
+
+  // -------------------------------------------------------------------------
+  // Workspace orchestration
+  // -------------------------------------------------------------------------
+
+  function repoByRoot(repositoryRoot) {
+    for (var i = 0; i < repositories.length; i += 1) {
+      if (repositories[i].root === repositoryRoot) return repositories[i]
+    }
+    return null
+  }
+
+  function projectInRepo(repository, projectID) {
+    for (var i = 0; i < repository.projects.length; i += 1) {
+      if (repository.projects[i].id === projectID) return repository.projects[i]
+    }
+    return null
+  }
+
+  function orchestrationKey(repositoryRoot, workspaceID) {
+    return repositoryRoot + "@" + workspaceID
+  }
+
+  function setOrchestration(key, record) {
+    var next = {}
+    var keys = Object.keys(orchestrations)
+    for (var i = 0; i < keys.length; i += 1)
+      next[keys[i]] = orchestrations[keys[i]]
+    if (record === null) delete next[key]
+    else next[key] = record
+    orchestrations = next
+  }
+
+  function orchestrationWith(record, state, message) {
+    return {
+      repoRoot: record.repoRoot, workspaceId: record.workspaceId,
+      name: record.name, plan: record.plan, state: state, message: message,
+    }
+  }
+
+  function startWorkspace(repository, workspace) {
+    var plan = Model.workspaceStartPlan(repository.projects, workspace)
+    if (plan.length === 0) return
+    setOrchestration(orchestrationKey(repository.root, workspace.id), {
+      repoRoot: repository.root, workspaceId: workspace.id,
+      name: workspace.name, plan: plan, state: "running", message: "",
+    })
+    Qt.callLater(advanceOrchestrations)
+  }
+
+  function stopWorkspace(repository, workspace) {
+    var key = orchestrationKey(repository.root, workspace.id)
+    var record = orchestrations[key]
+    var plan = record !== undefined ? record.plan
+      : Model.workspaceStartPlan(repository.projects, workspace)
+    setOrchestration(key, null)
+    var stops = Model.workspaceStopPlan(plan, repoStatusMap(repository, runtimes))
+    for (var i = 0; i < stops.length; i += 1) {
+      var project = projectInRepo(repository, stops[i])
+      if (project !== null) stopProject(project.key)
+    }
+  }
+
+  function advanceOrchestrations() {
+    var keys = Object.keys(orchestrations)
+    for (var i = 0; i < keys.length; i += 1) {
+      var record = orchestrations[keys[i]]
+      if (record.state !== "running") continue
+      // A reload in flight briefly empties the repository list and leaves
+      // loading placeholders; wait it out instead of halting spuriously.
+      if (!configLoaded) continue
+      var repository = repoByRoot(record.repoRoot)
+      if (repository === null) {
+        setOrchestration(keys[i], orchestrationWith(record, "halted",
+          "Halted: the repository was removed from the configuration."))
+        continue
+      }
+      if (repository.loading === true) continue
+      if (repository.ok !== true) {
+        setOrchestration(keys[i], orchestrationWith(record, "halted",
+          "Halted: the repository manifest now has blockers."))
+        continue
+      }
+      var projectsByID = {}
+      for (var j = 0; j < repository.projects.length; j += 1)
+        projectsByID[repository.projects[j].id] = repository.projects[j]
+      var step = Model.orchestrationStep(
+        record.plan, projectsByID, repoStatusMap(repository, runtimes))
+      if (step.blocked !== null) {
+        setOrchestration(keys[i], orchestrationWith(record, "halted",
+          "Halted: " + step.blocked.id + " is "
+          + Model.statusLabel(step.blocked.status).toLowerCase() + "."))
+        continue
+      }
+      if (step.done) {
+        setOrchestration(keys[i], orchestrationWith(record, "done",
+          "All " + step.total + " projects ready."))
+        if (configNotifications)
+          runRead(Model.notifySendArgv(
+            "Workspace " + record.name + " is ready",
+            step.total + " projects ready"), function() {})
+        continue
+      }
+      for (var s = 0; s < step.startNow.length; s += 1) {
+        var project = projectsByID[step.startNow[s]]
+        if (project === undefined) {
+          setOrchestration(keys[i], orchestrationWith(record, "halted",
+            "Halted: " + step.startNow[s] + " is no longer in the manifest."))
+          break
+        }
+        startProject(repository, project)
+      }
+    }
+  }
+
+  function workspacePlanSummary(plan, repository, runtimeMap) {
+    var ready = 0
+    var running = 0
+    for (var i = 0; i < plan.length; i += 1) {
+      var project = projectInRepo(repository, plan[i])
+      var status = Model.STATUS.stopped
+      if (project !== null && runtimeMap[project.key] !== undefined)
+        status = runtimeMap[project.key].status
+      if (status === Model.STATUS.ready) ready += 1
+      if (Model.isRunningStatus(status)) running += 1
+    }
+    return {
+      ready: ready, running: running, total: plan.length,
+      anyRunning: running > 0,
+      allReady: plan.length > 0 && ready === plan.length,
+    }
+  }
+
+  function workspaceStatusColor(record, planSummary) {
+    if (record !== undefined && record !== null && record.state === "halted")
+      return Model.statusColor(Model.STATUS.failed)
+    if (planSummary.allReady) return Model.statusColor(Model.STATUS.ready)
+    if (planSummary.anyRunning) return Model.statusColor(Model.STATUS.starting)
+    return Model.statusColor(Model.STATUS.stopped)
+  }
+
+  // -------------------------------------------------------------------------
+  // Manifest change watching
+  // -------------------------------------------------------------------------
+
+  function pollWatchedFiles() {
+    if (homeDirectory === "") return
+    // While a reload is in flight the repository list is momentarily empty;
+    // polling then would diff against a shrunken path set and re-trigger.
+    if (!configLoaded) return
+    var roots = []
+    for (var i = 0; i < repositories.length; i += 1)
+      roots.push(repositories[i].root)
+    runRead(Model.statWatchArgv(Model.watchPathsFor(configPath, roots)),
+      function(_exitCode, text) {
+        var times = Model.parseStatTimes(text)
+        var changed = root.watchTimes !== null
+          && !Model.sameStatTimes(root.watchTimes, times)
+        root.watchTimes = times
+        // Reload preserves runtimes; running processes are never touched.
+        if (changed) root.reload()
+      })
   }
 
   function openProject(project) {
@@ -392,6 +611,13 @@ Panel {
     repeat: true
     running: root.anyStarting
     onTriggered: root.pollStartingProjects()
+  }
+
+  Timer {
+    interval: Model.WATCH_POLL_INTERVAL_MS
+    repeat: true
+    running: true
+    onTriggered: root.pollWatchedFiles()
   }
 
   // -------------------------------------------------------------------------
@@ -752,6 +978,108 @@ Panel {
                         elide: Text.ElideRight
                       }
                     }
+                  }
+                }
+              }
+
+              Text {
+                width: parent.width
+                visible: (repositoryDelegate.repository.workspaces || []).length > 0
+                text: "Workspaces"
+                color: root.mutedForeground
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: root.smallFontSize
+                font.bold: true
+              }
+
+              Repeater {
+                model: repositoryDelegate.repository.workspaces || []
+                delegate: Column {
+                  id: workspaceDelegate
+                  required property var modelData
+                  readonly property var workspace: modelData
+                  readonly property var record: root.orchestrations[
+                    root.orchestrationKey(repositoryDelegate.repository.root, workspace.id)]
+                  readonly property var plan: Model.workspaceStartPlan(
+                    repositoryDelegate.repository.projects, workspace)
+                  readonly property var planSummary: root.workspacePlanSummary(
+                    plan, repositoryDelegate.repository, root.runtimes)
+                  width: parent.width
+                  spacing: Style.space(2)
+
+                  Row {
+                    width: parent.width
+                    spacing: Style.space(6)
+
+                    Rectangle {
+                      width: Style.space(8)
+                      height: Style.space(8)
+                      radius: width / 2
+                      anchors.verticalCenter: parent.verticalCenter
+                      color: root.workspaceStatusColor(
+                        workspaceDelegate.record, workspaceDelegate.planSummary)
+                    }
+
+                    Column {
+                      width: parent.width - Style.space(8) - workspaceActions.width - Style.space(12)
+                      anchors.verticalCenter: parent.verticalCenter
+                      Text {
+                        width: parent.width
+                        text: workspaceDelegate.workspace.name + "  ·  "
+                          + workspaceDelegate.planSummary.ready + "/"
+                          + workspaceDelegate.planSummary.total + " ready"
+                        color: root.barForeground
+                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        font.pixelSize: root.smallFontSize
+                        elide: Text.ElideRight
+                      }
+                      Text {
+                        width: parent.width
+                        text: workspaceDelegate.plan.join(" → ")
+                        color: root.faintForeground
+                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        font.pixelSize: root.smallFontSize
+                        elide: Text.ElideRight
+                      }
+                    }
+
+                    Row {
+                      id: workspaceActions
+                      spacing: Style.space(4)
+                      anchors.verticalCenter: parent.verticalCenter
+                      ActionButton {
+                        visible: !(workspaceDelegate.record !== undefined
+                          && workspaceDelegate.record.state === "running")
+                        label: "Start all"
+                        accent: Model.statusColor(Model.STATUS.ready)
+                        onActivated: root.startWorkspace(
+                          repositoryDelegate.repository, workspaceDelegate.workspace)
+                      }
+                      ActionButton {
+                        visible: workspaceDelegate.planSummary.anyRunning
+                          || (workspaceDelegate.record !== undefined
+                            && workspaceDelegate.record.state === "running")
+                        label: "Stop all"
+                        accent: Model.statusColor(Model.STATUS.failed)
+                        onActivated: root.stopWorkspace(
+                          repositoryDelegate.repository, workspaceDelegate.workspace)
+                      }
+                    }
+                  }
+
+                  Text {
+                    width: parent.width
+                    visible: workspaceDelegate.record !== undefined
+                      && workspaceDelegate.record.message !== ""
+                    text: workspaceDelegate.record !== undefined
+                      ? workspaceDelegate.record.message : ""
+                    color: workspaceDelegate.record !== undefined
+                      && workspaceDelegate.record.state === "halted"
+                      ? Model.statusColor(Model.STATUS.failed)
+                      : root.mutedForeground
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: root.smallFontSize
+                    wrapMode: Text.WordWrap
                   }
                 }
               }

@@ -415,3 +415,130 @@ test("path helpers behave on edges", () => {
     assert.equal(Model.joinPath("/root", "apps/web"), "/root/apps/web");
     assert.equal(Model.joinPath("/root", "./apps/web/"), "/root/apps/web");
 });
+
+test("parseRepositoriesConfig accepts opt-in flags that default to off", () => {
+    const defaults = Model.parseRepositoriesConfig(JSON.stringify({ repositories: ["/a"] }), "/home/me");
+    assert.equal(defaults.ok, true);
+    assert.equal(defaults.notifications, false);
+    assert.equal(defaults.openOnReady, false);
+
+    const enabled = Model.parseRepositoriesConfig(JSON.stringify({
+        repositories: ["/a"], notifications: true, openOnReady: true,
+    }), "/home/me");
+    assert.equal(enabled.ok, true);
+    assert.equal(enabled.notifications, true);
+    assert.equal(enabled.openOnReady, true);
+
+    const badType = Model.parseRepositoriesConfig(JSON.stringify({
+        repositories: ["/a"], notifications: "yes",
+    }), "/home/me");
+    assert.equal(badType.ok, false);
+    assert.equal(badType.errors[0].code, "config-notifications-invalid");
+});
+
+const PLAN_PROJECTS = [
+    { id: "db", dependsOn: [] },
+    { id: "api", dependsOn: ["db"] },
+    { id: "web", dependsOn: ["api"] },
+    { id: "docs", dependsOn: [] },
+];
+
+test("workspaceStartPlan orders dependencies first and pulls in transitive deps", () => {
+    assert.deepEqual(
+        Model.workspaceStartPlan(PLAN_PROJECTS, { projects: ["web", "docs"] }),
+        ["db", "api", "web", "docs"]);
+    // A workspace listing only the leaf still starts its whole chain.
+    assert.deepEqual(
+        Model.workspaceStartPlan(PLAN_PROJECTS, { projects: ["web"] }),
+        ["db", "api", "web"]);
+    // Diamond: d depends on b and c, both depend on a.
+    const diamond = [
+        { id: "a", dependsOn: [] },
+        { id: "b", dependsOn: ["a"] },
+        { id: "c", dependsOn: ["a"] },
+        { id: "d", dependsOn: ["b", "c"] },
+    ];
+    assert.deepEqual(
+        Model.workspaceStartPlan(diamond, { projects: ["d"] }),
+        ["a", "b", "c", "d"]);
+});
+
+test("orchestrationStep starts eligible members, waits, halts, and completes", () => {
+    const S = Model.STATUS;
+    const byID = {};
+    for (const project of PLAN_PROJECTS) byID[project.id] = project;
+    const plan = ["db", "api", "docs", "web"];
+
+    const initial = Model.orchestrationStep(plan, byID, {});
+    assert.deepEqual(initial.startNow, ["db", "docs"]);
+    assert.deepEqual(initial.waiting, ["api", "web"]);
+    assert.equal(initial.done, false);
+    assert.equal(initial.blocked, null);
+
+    const midway = Model.orchestrationStep(plan, byID,
+        { db: S.ready, docs: S.starting, api: S.stopped, web: S.stopped });
+    assert.deepEqual(midway.startNow, ["api"]);
+    assert.deepEqual(midway.waiting, ["docs", "web"]);
+
+    const halted = Model.orchestrationStep(plan, byID,
+        { db: S.ready, docs: S.ready, api: S.failed, web: S.stopped });
+    assert.deepEqual(halted.blocked, { id: "api", status: S.failed });
+    assert.equal(halted.done, false);
+    assert.deepEqual(halted.startNow, []);
+
+    const done = Model.orchestrationStep(plan, byID,
+        { db: S.ready, docs: S.ready, api: S.ready, web: S.ready });
+    assert.equal(done.done, true);
+    assert.equal(done.readyCount, 4);
+});
+
+test("workspaceStopPlan stops dependents before dependencies, running only", () => {
+    const S = Model.STATUS;
+    assert.deepEqual(
+        Model.workspaceStopPlan(["db", "api", "docs", "web"],
+            { db: S.ready, api: S.ready, docs: S.stopped, web: S.starting }),
+        ["web", "api", "db"]);
+    assert.deepEqual(Model.workspaceStopPlan(["db"], { db: S.stopped }), []);
+});
+
+test("watch helpers build stat argv and parse mtimes, including spaced paths", () => {
+    const paths = Model.watchPathsFor("/home/me/.config/localwrap/repositories.json", ["/home/me/my src"]);
+    assert.deepEqual(paths, [
+        "/home/me/.config/localwrap/repositories.json",
+        "/home/me/my src/.localwrap/workspace.json",
+        "/home/me/my src/localwrap.json",
+    ]);
+    assert.deepEqual(Model.statWatchArgv(["/a", "/b"]),
+        ["stat", "-c", "%n %Y", "/a", "/b"]);
+
+    const times = Model.parseStatTimes(
+        "/home/me/my src/localwrap.json 1755900000\n/a/b.json 1755900001\nnoise\n");
+    assert.deepEqual(times, {
+        "/home/me/my src/localwrap.json": "1755900000",
+        "/a/b.json": "1755900001",
+    });
+    assert.equal(Model.sameStatTimes(times, { ...times }), true);
+    assert.equal(Model.sameStatTimes(times, { ...times, "/a/b.json": "1755900002" }), false);
+    assert.equal(Model.sameStatTimes(times, {}), false);
+    assert.equal(Model.WATCH_POLL_INTERVAL_MS, 5000);
+});
+
+test("notifications cover notable transitions only and build a safe argv", () => {
+    const S = Model.STATUS;
+    assert.deepEqual(Model.notificationForTransition("Web", S.ready, "http://localhost:3000"),
+        { summary: "Web is ready", body: "http://localhost:3000" });
+    assert.equal(Model.notificationForTransition("Web", S.failed, "code 1").summary, "Web failed");
+    assert.notEqual(Model.notificationForTransition("Web", S.conflict, ""), null);
+    assert.notEqual(Model.notificationForTransition("Web", S.stalled, ""), null);
+    assert.equal(Model.notificationForTransition("Web", S.starting, ""), null);
+    assert.equal(Model.notificationForTransition("Web", S.stopped, ""), null);
+
+    assert.deepEqual(Model.notifySendArgv("Web is ready", "http://localhost:3000"),
+        ["notify-send", "-a", "LocalWrap", "Web is ready", "http://localhost:3000"]);
+    assert.deepEqual(Model.notifySendArgv("Web failed", ""),
+        ["notify-send", "-a", "LocalWrap", "Web failed"]);
+});
+
+test("dirCheckArgv wraps test -d", () => {
+    assert.deepEqual(Model.dirCheckArgv("/repo/apps/web"), ["test", "-d", "/repo/apps/web"]);
+});

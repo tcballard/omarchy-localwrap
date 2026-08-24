@@ -14,7 +14,7 @@ contract and share the same safety model. It is a re-implementation for the
 Quattro plugin runtime, not a port; the macOS app's deeper features (Doctor,
 crash-safe ownership ledger, live preview, support reports) remain app-only.
 
-Status: **experimental**, version 0.1.0.
+Status: **experimental**, version 0.2.0.
 
 ## What it does
 
@@ -33,6 +33,19 @@ Status: **experimental**, version 0.1.0.
 - **Open** hands the project's validated loopback URL to your default
   browser. **Stop** terminates the process the plugin started.
 - Projects with `dependsOn` stay gated until their dependencies are Ready.
+- Manifest `workspaces` get **Start all** / **Stop all**: starting brings up
+  the grouping's members plus their transitive dependencies in dependency
+  order, waiting for each dependency to become Ready; stopping works in
+  reverse. A member that fails, conflicts, or stalls halts the run with a
+  visible reason.
+- Configuration and manifest edits are picked up automatically (mtime
+  polling every 5 s); a reload never touches running processes. **Rescan**
+  remains for immediate refresh.
+- Opt-in desktop notifications (`notify-send`) on Ready, Failed, port
+  conflict, and not-ready-in-time transitions — status only, never command
+  output.
+- Opt-in auto-open on Ready: only when your configuration enables
+  `openOnReady` *and* the project's manifest sets `openOnReady`.
 - A running process whose manifest entry disappears after a rescan stays
   listed until you stop it — the plugin never loses track of a process it
   started.
@@ -40,7 +53,9 @@ Status: **experimental**, version 0.1.0.
 ## Requirements
 
 - Omarchy with the Quattro shell (plugin `schemaVersion` 1).
-- `curl` (readiness probes) and `which` — present on any Omarchy install.
+- `curl` (readiness probes), `which`, `test`, and `stat` (coreutils) —
+  present on any Omarchy install.
+- `notify-send` (libnotify), only if you enable notifications.
 - The runtimes your manifests use (`npm`, `pnpm`, `bun`, …) on `PATH`.
 
 ## Install
@@ -65,9 +80,17 @@ manifests you trust:
   "repositories": [
     "~/src/storefront",
     "/home/you/src/blog"
-  ]
+  ],
+  "notifications": false,
+  "openOnReady": false
 }
 ```
+
+Both optional flags default to off. `notifications` sends desktop
+notifications on runtime transitions. `openOnReady` lets a project open in
+your browser when it becomes ready — and even then only for projects whose
+manifest also sets `"openOnReady": true`, so both you and the manifest
+author must opt in.
 
 Each repository needs a LocalWrap workspace manifest, for example
 `.localwrap/workspace.json`:
@@ -89,7 +112,8 @@ Each repository needs a LocalWrap workspace manifest, for example
 
 See the [manifest v1 guide](https://github.com/tcballard/LocalWrap/blob/main/Documentation/workspace-manifest-v1.md)
 and [JSON Schema](https://github.com/tcballard/LocalWrap/blob/main/Documentation/schema/workspace-manifest-v1.schema.json)
-for every field. Use **Rescan** in the panel after editing either file.
+for every field. Edits to either file are picked up automatically within a
+few seconds; **Rescan** in the panel forces an immediate refresh.
 
 ## Usage
 
@@ -97,6 +121,12 @@ Click the `LW` widget to open the cockpit. Each project row shows a status
 dot (gray stopped, yellow starting, green ready, orange running-but-not-ready,
 red failed or port conflict), the exact command it will run, and its URL.
 Start, Stop, and Open act on that row alone; Escape closes the panel.
+
+Below a repository's projects, its manifest `workspaces` appear with their
+computed start order (`db → api → web`) and a ready count. **Start all**
+walks that order, starting each project once its dependencies are Ready;
+**Stop all** stops the grouping in reverse. If a member fails on the way up,
+the run halts and the row says why.
 
 ## Security model
 
@@ -114,8 +144,11 @@ plugin keeps LocalWrap's fail-closed rules:
 - Nothing autostarts. Reading configuration and manifests is passive;
   `autostart` in a manifest is parsed but deliberately not acted on.
 - The only external commands the plugin runs are `cat` (read config and
-  manifests), `which` (confirm an executable exists), `curl` (loopback
-  readiness probes), and the reviewed project commands you explicitly start.
+  manifests), `which` (confirm an executable exists), `test -d` (confirm the
+  project directory exists), `curl` (loopback readiness probes), `stat`
+  (poll config/manifest mtimes), `notify-send` (only when notifications are
+  enabled), and the reviewed project commands you explicitly start. All are
+  invoked with fixed argument lists, never through a shell.
 - Process output is kept only in memory (a bounded tail shown on failure)
   and never written to disk.
 
@@ -127,8 +160,9 @@ plugin keeps LocalWrap's fail-closed rules:
   children.
 - A project that is running but not ready within 30 s is marked
   "Running, not ready" and left running for you to inspect or stop.
-- Workspace groupings (`workspaces`) are validated but not yet orchestrated;
-  `openOnReady` is parsed but the plugin never opens a browser on its own.
+- A halted workspace run (a member failed, conflicted, stalled, or left the
+  manifest) stays halted with its reason until you press **Start all** again;
+  automatic reloads never restart or stop anything on their own.
 - Manifest path containment is enforced lexically (`..` may not escape the
   repository); the macOS app additionally resolves symlinks on disk.
 - If the bar instantiates widgets per monitor, each instance manages its own
@@ -185,8 +219,7 @@ Removal stops anything the plugin started. Your repositories, manifests, and
 ## Roadmap
 
 - Submission to the [Omarchy plugin marketplace](https://omarchyplugins.com).
-- Workspace orchestration (dependency-ordered start of a saved grouping).
-- Manifest file watching instead of manual Rescan.
+- Richer per-project diagnostics (closer to the macOS app's Project Doctor).
 
 ## License
 

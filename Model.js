@@ -746,13 +746,23 @@ function findDependencyCycleMember(projects) {
 
 // The plugin's own configuration is one explicit, user-owned file:
 //   ~/.config/localwrap/repositories.json
-//   { "repositories": ["/absolute/path/to/repo", "~/relative/to/home"] }
+//   {
+//     "repositories": ["/absolute/path/to/repo", "~/relative/to/home"],
+//     "notifications": false,
+//     "openOnReady": false
+//   }
 // Listing a repository only allows its manifest to be read and reviewed;
-// nothing is ever started from configuration alone.
+// nothing is ever started from configuration alone. Both optional flags
+// default to off: notifications sends desktop notifications on runtime
+// transitions, and openOnReady allows opening a project's URL when it
+// becomes ready (only for projects whose manifest also opts in).
 function parseRepositoriesConfig(text, homeDirectory) {
     var errors = [];
     var repositories = [];
-    var result = { ok: false, errors: errors, repositories: repositories };
+    var result = {
+        ok: false, errors: errors, repositories: repositories,
+        notifications: false, openOnReady: false,
+    };
 
     var root;
     try {
@@ -769,9 +779,25 @@ function parseRepositoriesConfig(text, homeDirectory) {
     }
     var keys = Object.keys(root);
     for (var k = 0; k < keys.length; k += 1) {
-        if (keys[k] !== "repositories") {
+        if (!contains(["repositories", "notifications", "openOnReady"], keys[k])) {
             errors.push(makeDiagnostic("config-unknown-field", keys[k],
                 "Unknown configuration field \"" + keys[k] + "\"."));
+        }
+    }
+    if (root.notifications !== undefined) {
+        if (!isBoolean(root.notifications)) {
+            errors.push(makeDiagnostic("config-notifications-invalid", "notifications",
+                "notifications must be a boolean."));
+        } else {
+            result.notifications = root.notifications;
+        }
+    }
+    if (root.openOnReady !== undefined) {
+        if (!isBoolean(root.openOnReady)) {
+            errors.push(makeDiagnostic("config-open-on-ready-invalid", "openOnReady",
+                "openOnReady must be a boolean."));
+        } else {
+            result.openOnReady = root.openOnReady;
         }
     }
     if (!Array.isArray(root.repositories)) {
@@ -948,6 +974,202 @@ function appendOutputTail(existing, chunk, maxLines) {
     return kept;
 }
 
+// ---------------------------------------------------------------------------
+// Workspace orchestration (dependency-ordered start)
+// ---------------------------------------------------------------------------
+
+// The start plan for a workspace is its members plus every transitive
+// dependency, ordered so dependencies come before dependents. Ties follow
+// manifest order, keeping plans deterministic. Cycles cannot reach here:
+// parsing rejects them as blockers.
+function workspaceStartPlan(projects, workspace) {
+    var byID = {};
+    var i;
+    for (i = 0; i < projects.length; i += 1) {
+        byID[projects[i].id] = projects[i];
+    }
+    var include = {};
+    function add(id) {
+        if (include[id] === true || byID[id] === undefined) { return; }
+        include[id] = true;
+        var deps = byID[id].dependsOn || [];
+        for (var d = 0; d < deps.length; d += 1) { add(deps[d]); }
+    }
+    for (i = 0; i < workspace.projects.length; i += 1) {
+        add(workspace.projects[i]);
+    }
+
+    var plan = [];
+    var placed = {};
+    var remaining = 0;
+    for (i = 0; i < projects.length; i += 1) {
+        if (include[projects[i].id] === true) { remaining += 1; }
+    }
+    while (remaining > 0) {
+        var progressed = false;
+        for (i = 0; i < projects.length; i += 1) {
+            var candidate = projects[i];
+            if (include[candidate.id] !== true || placed[candidate.id] === true) {
+                continue;
+            }
+            var deps = candidate.dependsOn || [];
+            var waitingOnDep = false;
+            for (var d2 = 0; d2 < deps.length; d2 += 1) {
+                if (include[deps[d2]] === true && placed[deps[d2]] !== true) {
+                    waitingOnDep = true;
+                    break;
+                }
+            }
+            if (waitingOnDep) { continue; }
+            placed[candidate.id] = true;
+            plan.push(candidate.id);
+            remaining -= 1;
+            progressed = true;
+        }
+        if (!progressed) { break; }
+    }
+    return plan;
+}
+
+// Stop dependents before their dependencies: the reverse of the start plan,
+// filtered to members that are actually running.
+function workspaceStopPlan(plan, statusesByID) {
+    var stops = [];
+    for (var i = plan.length - 1; i >= 0; i -= 1) {
+        if (isRunningStatus(statusesByID[plan[i]])) { stops.push(plan[i]); }
+    }
+    return stops;
+}
+
+// One orchestration decision. Returns which plan members may start right
+// now (stopped with every dependency ready), which are still waiting, the
+// first member that halted the run (failed, conflict, or stalled), and
+// whether the whole plan is ready.
+function orchestrationStep(plan, projectsByID, statusesByID) {
+    var startNow = [];
+    var waiting = [];
+    var blocked = null;
+    var readyCount = 0;
+    for (var i = 0; i < plan.length; i += 1) {
+        var id = plan[i];
+        var status = statusesByID[id] === undefined ? STATUS.stopped : statusesByID[id];
+        if (status === STATUS.ready) {
+            readyCount += 1;
+            continue;
+        }
+        if (status === STATUS.failed || status === STATUS.conflict
+            || status === STATUS.stalled) {
+            if (blocked === null) { blocked = { id: id, status: status }; }
+            continue;
+        }
+        if (status === STATUS.starting || status === STATUS.stopping) {
+            waiting.push(id);
+            continue;
+        }
+        var project = projectsByID[id];
+        var deps = project ? (project.dependsOn || []) : [];
+        var depsReady = true;
+        for (var d = 0; d < deps.length; d += 1) {
+            if (statusesByID[deps[d]] !== STATUS.ready) {
+                depsReady = false;
+                break;
+            }
+        }
+        if (depsReady) { startNow.push(id); } else { waiting.push(id); }
+    }
+    return {
+        startNow: startNow,
+        waiting: waiting,
+        blocked: blocked,
+        readyCount: readyCount,
+        total: plan.length,
+        done: blocked === null && readyCount === plan.length,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Manifest change watching (mtime polling)
+// ---------------------------------------------------------------------------
+
+var WATCH_POLL_INTERVAL_MS = 5000;
+
+// Watch the configuration file plus both manifest candidates for every
+// repository, so newly created manifests are noticed too.
+function watchPathsFor(configPath, repositoryRoots) {
+    var paths = [configPath];
+    for (var i = 0; i < repositoryRoots.length; i += 1) {
+        var candidates = manifestCandidatePaths(repositoryRoots[i]);
+        for (var j = 0; j < candidates.length; j += 1) {
+            paths.push(candidates[j]);
+        }
+    }
+    return paths;
+}
+
+function statWatchArgv(paths) {
+    return ["stat", "-c", "%n %Y"].concat(paths);
+}
+
+// stat prints "<path> <mtime>" per existing file; missing files only add
+// stderr noise. Paths may contain spaces, so split on the last space and
+// require the trailing token to be a pure integer timestamp.
+function parseStatTimes(text) {
+    var times = {};
+    var lines = String(text).split("\n");
+    for (var i = 0; i < lines.length; i += 1) {
+        var cut = lines[i].lastIndexOf(" ");
+        if (cut <= 0) { continue; }
+        var mtime = lines[i].slice(cut + 1);
+        if (!/^\d+$/.test(mtime)) { continue; }
+        times[lines[i].slice(0, cut)] = mtime;
+    }
+    return times;
+}
+
+function sameStatTimes(a, b) {
+    var aKeys = Object.keys(a);
+    var bKeys = Object.keys(b);
+    if (aKeys.length !== bKeys.length) { return false; }
+    for (var i = 0; i < aKeys.length; i += 1) {
+        if (b[aKeys[i]] !== a[aKeys[i]]) { return false; }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Desktop notifications (opt-in, transition-only)
+// ---------------------------------------------------------------------------
+
+// Mirrors the app's opt-in runtime notifications: deduplicated status
+// transitions only, never command output. Returns null for statuses that
+// are not notable.
+function notificationForTransition(name, status, detail) {
+    switch (status) {
+    case STATUS.ready:
+        return { summary: name + " is ready", body: detail || "" };
+    case STATUS.failed:
+        return { summary: name + " failed", body: detail || "" };
+    case STATUS.conflict:
+        return { summary: name + ": port already in use", body: detail || "" };
+    case STATUS.stalled:
+        return { summary: name + " is running but not ready", body: detail || "" };
+    default:
+        return null;
+    }
+}
+
+function notifySendArgv(summary, body) {
+    var argv = ["notify-send", "-a", "LocalWrap", summary];
+    if (isNonEmptyString(body)) { argv.push(body); }
+    return argv;
+}
+
+// Pre-start check that the project directory exists, mirroring the app's
+// cwd-missing Doctor finding.
+function dirCheckArgv(path) {
+    return ["test", "-d", path];
+}
+
 if (typeof module !== "undefined" && module.exports) {
     module.exports = {
         ALLOWED_EXECUTABLES: ALLOWED_EXECUTABLES,
@@ -982,5 +1204,16 @@ if (typeof module !== "undefined" && module.exports) {
         curlProbeArgv: curlProbeArgv,
         isReadyHttpCode: isReadyHttpCode,
         appendOutputTail: appendOutputTail,
+        WATCH_POLL_INTERVAL_MS: WATCH_POLL_INTERVAL_MS,
+        workspaceStartPlan: workspaceStartPlan,
+        workspaceStopPlan: workspaceStopPlan,
+        orchestrationStep: orchestrationStep,
+        watchPathsFor: watchPathsFor,
+        statWatchArgv: statWatchArgv,
+        parseStatTimes: parseStatTimes,
+        sameStatTimes: sameStatTimes,
+        notificationForTransition: notificationForTransition,
+        notifySendArgv: notifySendArgv,
+        dirCheckArgv: dirCheckArgv,
     };
 }
