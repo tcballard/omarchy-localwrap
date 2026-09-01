@@ -1,20 +1,16 @@
 # LocalWrap for Omarchy
 
-A bar-widget cockpit for local development projects on
-[Omarchy](https://omarchy.org)'s Quattro shell. It reads the
-version-controlled LocalWrap workspace manifest a repository commits
-(`.localwrap/workspace.json`, or `localwrap.json` at the repository root) and
-lets you start, monitor, stop, and open the loopback apps the repository
-describes — without terminal juggling.
+**Your local development workspace, controlled from the Quattro bar.**
 
-This is the Linux companion to the
-[LocalWrap macOS app](https://github.com/tcballard/LocalWrap): both speak the
-same [workspace manifest v1](https://github.com/tcballard/LocalWrap/blob/main/Documentation/workspace-manifest-v1.md)
-contract and share the same safety model. It is a re-implementation for the
-Quattro plugin runtime, not a port; the macOS app's deeper features (Doctor,
-crash-safe ownership ledger, live preview, support reports) remain app-only.
+LocalWrap is an Omarchy bar widget for developers running multi-service projects. It reads a repository-owned LocalWrap manifest and gives you one cockpit to start dependencies in order, watch readiness, stop services, and open their loopback apps. Reading remains passive: nothing runs until you press **Start**.
 
-Status: **experimental**, version 0.2.0.
+Install it on Omarchy Quattro:
+
+```sh
+omarchy plugin add https://github.com/tcballard/omarchy-localwrap.git --enable
+```
+
+**Confirmed on Quattro.** The same portable model used by the QML interface is covered by [32 Node tests](tests/model.test.js), and the repository includes a [dependency-free demo workspace](examples/demo) for exercising startup order and readiness.
 
 ## What it does
 
