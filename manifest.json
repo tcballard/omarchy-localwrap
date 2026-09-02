@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.tcballard.localwrap",
   "name": "LocalWrap",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "author": "Tom Ballard",
   "license": "Apache-2.0",
   "description": "A cockpit for local development projects: start, monitor, and open the loopback apps described by a repository's LocalWrap workspace manifest.",

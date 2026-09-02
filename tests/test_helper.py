@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -97,7 +98,7 @@ class HelperTests(unittest.TestCase):
             value = manifest()
             value["projects"][0]["command"] = "python3 linked.py"
             self.write_manifest(value)
-            with self.assertRaisesRegex(helper.LocalWrapError, "outside the repository"):
+            with self.assertRaisesRegex(helper.LocalWrapError, "without following links"):
                 helper.launch_plan(self.root, "web")
         finally:
             outside.unlink()
@@ -161,6 +162,151 @@ class HelperTests(unittest.TestCase):
         second = helper.launch_plan(self.root, "web")
         self.assertNotEqual(first["fingerprint"], second["fingerprint"])
 
+    def test_manifest_fields_and_digest_share_one_read_snapshot(self) -> None:
+        path = self.write_manifest(manifest())
+        original = path.read_bytes()
+        real_decode = helper.decode_json
+
+        def replace_after_read(raw: bytes, label: str):
+            if label == "workspace manifest":
+                changed = manifest()
+                changed["projects"][0]["name"] = "Changed after held read"
+                path.write_text(json.dumps(changed), encoding="utf-8")
+            return real_decode(raw, label)
+
+        with mock.patch.object(helper, "decode_json", side_effect=replace_after_read):
+            plan = helper.launch_plan(self.root, "web")
+        self.assertEqual(plan["projectName"], "Web")
+        self.assertEqual(plan["origins"][0]["sha256"], helper.bytes_digest(original))
+
+    def test_package_fields_and_digest_share_one_read_snapshot(self) -> None:
+        package_path = self.root / "package.json"
+        original = json.dumps({"scripts": {"dev": "printf original > result.txt"}}).encode()
+        package_path.write_bytes(original)
+        value = manifest()
+        value["projects"][0]["command"] = "npm run dev"
+        self.write_manifest(value)
+        real_decode = helper.decode_json
+
+        def replace_after_read(raw: bytes, label: str):
+            if label == "package.json":
+                package_path.write_text(
+                    json.dumps({"scripts": {"dev": "printf changed > result.txt"}}),
+                    encoding="utf-8",
+                )
+            return real_decode(raw, label)
+
+        with mock.patch.object(helper, "decode_json", side_effect=replace_after_read):
+            plan = helper.launch_plan(self.root, "web")
+        package_origin = plan["origins"][1]
+        self.assertEqual(package_origin["scripts"][0]["value"], "printf original > result.txt")
+        self.assertEqual(package_origin["sha256"], helper.bytes_digest(original))
+
+    def test_interpreter_executes_sealed_snapshot_after_path_mutation(self) -> None:
+        (self.root / "local_value.py").write_text("VALUE = 'reviewed'\n", encoding="utf-8")
+        (self.root / "server.py").write_text(
+            "from pathlib import Path\nfrom local_value import VALUE\n"
+            "assert Path(__file__).name == 'server.py'\nPath('result.txt').write_text(VALUE)\n",
+            encoding="utf-8",
+        )
+        self.write_manifest(manifest())
+        reviewed = helper.launch_plan(self.root, "web")
+        real_prepare = helper.prepare_launch
+
+        def swap_after_prepare(root: Path, project_id: str):
+            plan, prepared = real_prepare(root, project_id)
+            (self.root / "server.py").write_text(
+                "from pathlib import Path\nPath('result.txt').write_text('unreviewed')\n",
+                encoding="utf-8",
+            )
+            return plan, prepared
+
+        with mock.patch.object(helper, "prepare_launch", side_effect=swap_after_prepare):
+            with self.assertRaises(SystemExit) as result:
+                helper.command_run(str(self.root), "web", reviewed["fingerprint"])
+        self.assertEqual(result.exception.code, 0)
+        self.assertEqual((self.root / "result.txt").read_text(), "reviewed")
+
+    def test_working_directory_descriptor_survives_path_replacement(self) -> None:
+        app = self.root / "app"
+        app.mkdir()
+        (app / "server.py").write_text(
+            "from pathlib import Path\nPath('result.txt').write_text('reviewed')\n",
+            encoding="utf-8",
+        )
+        value = manifest()
+        value["projects"][0]["path"] = "app"
+        self.write_manifest(value)
+        reviewed = helper.launch_plan(self.root, "web")
+        real_prepare = helper.prepare_launch
+        displaced = self.root / "reviewed-app"
+
+        def swap_after_prepare(root: Path, project_id: str):
+            plan, prepared = real_prepare(root, project_id)
+            app.rename(displaced)
+            app.mkdir()
+            (app / "server.py").write_text("raise SystemExit('unreviewed')\n", encoding="utf-8")
+            return plan, prepared
+
+        with mock.patch.object(helper, "prepare_launch", side_effect=swap_after_prepare):
+            with self.assertRaises(SystemExit) as result:
+                helper.command_run(str(self.root), "web", reviewed["fingerprint"])
+        self.assertEqual(result.exception.code, 0)
+        self.assertEqual((displaced / "result.txt").read_text(), "reviewed")
+        self.assertFalse((app / "result.txt").exists())
+
+    def test_node_snapshot_preserves_module_path_semantics(self) -> None:
+        (self.root / "local-value.js").write_text(
+            "module.exports = 'reviewed';\n", encoding="utf-8"
+        )
+        (self.root / "server.js").write_text(
+            "const fs = require('fs'); const value = require('./local-value'); "
+            "if (!__filename.endsWith('/server.js')) process.exit(9); "
+            "fs.writeFileSync('result.txt', value);\n",
+            encoding="utf-8",
+        )
+        value = manifest()
+        value["projects"][0]["command"] = "node server.js"
+        self.write_manifest(value)
+        reviewed = helper.launch_plan(self.root, "web")
+        real_prepare = helper.prepare_launch
+
+        def swap_after_prepare(root: Path, project_id: str):
+            plan, prepared = real_prepare(root, project_id)
+            (self.root / "server.js").write_text("process.exit(8);\n", encoding="utf-8")
+            return plan, prepared
+
+        with mock.patch.object(helper, "prepare_launch", side_effect=swap_after_prepare):
+            with self.assertRaises(SystemExit) as result:
+                helper.command_run(str(self.root), "web", reviewed["fingerprint"])
+        self.assertEqual(result.exception.code, 0)
+        self.assertEqual((self.root / "result.txt").read_text(), "reviewed")
+
+    def test_package_execution_never_reopens_changed_package_json(self) -> None:
+        package_path = self.root / "package.json"
+        package_path.write_text(
+            json.dumps({"scripts": {"dev": "printf reviewed > result.txt"}}), encoding="utf-8"
+        )
+        value = manifest()
+        value["projects"][0]["command"] = "npm run dev"
+        self.write_manifest(value)
+        reviewed = helper.launch_plan(self.root, "web")
+        real_prepare = helper.prepare_launch
+
+        def swap_after_prepare(root: Path, project_id: str):
+            plan, prepared = real_prepare(root, project_id)
+            package_path.write_text(
+                json.dumps({"scripts": {"dev": "printf unreviewed > result.txt"}}),
+                encoding="utf-8",
+            )
+            return plan, prepared
+
+        with mock.patch.object(helper, "prepare_launch", side_effect=swap_after_prepare):
+            with self.assertRaises(SystemExit) as result:
+                helper.command_run(str(self.root), "web", reviewed["fingerprint"])
+        self.assertEqual(result.exception.code, 0)
+        self.assertEqual((self.root / "result.txt").read_text(), "reviewed")
+
     def test_config_is_bounded_deduplicated_and_atomically_written(self) -> None:
         config_path = self.root / "config" / "repositories.json"
         config = {"repositories": [str(self.root)], "notifications": False, "openOnReady": False}
@@ -185,6 +331,67 @@ class HelperTests(unittest.TestCase):
         ]
         helper.atomic_write_json(config_path, loaded)
         self.assertEqual(helper.load_config(config_path)["repositories"], [])
+
+    def test_install_noreplace_refuses_concurrent_destination_without_nesting(self) -> None:
+        parent = self.root / ".config" / "omarchy" / "plugins"
+        parent.mkdir(parents=True)
+        staging = parent / ".io.github.tcballard.localwrap.stage.test"
+        staging.mkdir()
+        (staging / "manifest.json").write_text(
+            json.dumps({"id": "io.github.tcballard.localwrap"}), encoding="utf-8"
+        )
+        target = parent / "io.github.tcballard.localwrap"
+        real_rename = helper.renameat2
+
+        def create_destination_then_rename(*args):
+            target.mkdir()
+            (target / "attacker.txt").write_text("preserve", encoding="utf-8")
+            return real_rename(*args)
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.root)}):
+            with mock.patch.object(helper, "renameat2", side_effect=create_destination_then_rename):
+                with self.assertRaisesRegex(helper.LocalWrapError, "destination appeared"):
+                    helper.command_install_swap(str(staging), str(target), "0")
+        self.assertTrue(staging.is_dir())
+        self.assertEqual((target / "attacker.txt").read_text(), "preserve")
+        self.assertFalse((target / staging.name).exists())
+
+    def test_install_exchange_restores_prior_target_when_new_target_is_displaced(self) -> None:
+        parent = self.root / ".config" / "omarchy" / "plugins"
+        parent.mkdir(parents=True)
+        staging = parent / ".io.github.tcballard.localwrap.stage.exchange"
+        staging.mkdir()
+        (staging / "manifest.json").write_text(
+            json.dumps({"id": "io.github.tcballard.localwrap", "version": "new"}), encoding="utf-8"
+        )
+        target = parent / "io.github.tcballard.localwrap"
+        target.mkdir()
+        (target / "manifest.json").write_text(
+            json.dumps({"id": "io.github.tcballard.localwrap", "version": "old"}), encoding="utf-8"
+        )
+        (target / "prior.txt").write_text("prior", encoding="utf-8")
+        displaced_new = parent / "new-install-displaced"
+        real_rename = helper.renameat2
+        calls = 0
+
+        def displace_after_exchange(*args):
+            nonlocal calls
+            calls += 1
+            result = real_rename(*args)
+            if calls == 1:
+                target.rename(displaced_new)
+                target.mkdir()
+                (target / "attacker.txt").write_text("attacker", encoding="utf-8")
+            return result
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.root)}):
+            with mock.patch.object(helper, "renameat2", side_effect=displace_after_exchange):
+                with self.assertRaisesRegex(helper.LocalWrapError, "prior installation was restored"):
+                    helper.command_install_swap(str(staging), str(target), "1")
+        self.assertEqual(calls, 2)
+        self.assertEqual((target / "prior.txt").read_text(), "prior")
+        self.assertEqual((staging / "attacker.txt").read_text(), "attacker")
+        self.assertTrue((displaced_new / "manifest.json").is_file())
 
     def test_output_is_capped_before_qml_receives_it(self) -> None:
         (self.root / "server.py").write_text(

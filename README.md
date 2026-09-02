@@ -95,8 +95,11 @@ When Start is pressed, LocalWrap resolves and displays:
 
 Confirm only if you trust that repository and exact command. The helper creates
 a SHA-256 fingerprint over the complete launch plan and rebuilds it immediately
-before execution. A changed manifest, package script, executable, path, or
-symlink fails closed and requires review again.
+before execution. Manifest and package fields and hashes come from the same
+held read. On the accepted pass, the executable and working directory remain
+descriptor-pinned and interpreter bytes execute from a sealed memory snapshot.
+A changed origin, executable, directory identity, path, or symlink fails closed
+and requires review again.
 
 ## Security model
 
@@ -107,17 +110,22 @@ repository and all live output as hostile input.
 
 - `npx`, `npm exec`, `deno run`, eval flags, shell operators, quoting, and
   arbitrary interpreter paths are rejected.
-- Package managers permit only `<npm|pnpm|yarn|bun> run <name>` plus
-  `npm start`. The exact local package script is part of the review fingerprint.
-- Node and Python require a real repository-contained script path.
-- Support commands use fixed argument arrays. Manifest text is never passed to
-  a shell by QML.
+- Package-manager manifests permit only `<npm|pnpm|yarn|bun> run <name>` plus
+  `npm start`. LocalWrap reads `package.json` once and executes the exact
+  reviewed pre/main/post lifecycle strings through a descriptor-pinned shell;
+  the mutable package file is never reopened after confirmation validation.
+- Node and Python require a repository-contained script. Its reviewed bytes are
+  copied into a sealed `memfd` and executed with the original path semantics, so
+  replacing the script after validation cannot change what runs.
+- Support commands use fixed argument arrays. QML never invokes a shell.
 
 ### Files and bounded parsing
 
 - Repository roots, manifests, working directories, package files, and scripts
-  are resolved on disk and must remain within the real repository root.
-- Manifests and package files themselves may not be symlinks.
+  are opened component-by-component with no-follow descriptors. Working
+  directory and executable device/inode identities are fingerprinted.
+- Manifest/package content is decoded and hashed from one bounded read; neither
+  can combine fields from one generation with a digest from another.
 - Configuration is capped at 16 KiB and manifests at 64 KiB before decoding.
 - JSON depth is capped at 12 before `json.loads`/`JSON.parse` materialization.
 - A manifest permits at most 32 projects, 16 workspaces, 16 dependencies per
@@ -150,10 +158,13 @@ provides the same payload safely:
 ./install.sh --force
 ```
 
-The installer rejects source/destination symlinks and ownership collisions,
-stages the complete fixed payload beside the destination, verifies every
-copied SHA-256, applies fixed modes, and atomically swaps it. An interrupted
-replacement restores the previous complete directory.
+The installer verifies every destination component as a real user-owned
+directory, serializes installs with a no-follow lock, and stages the complete
+fixed payload beside a held parent descriptor. It verifies every copied
+SHA-256, applies fixed modes, then uses descriptor-relative Linux `renameat2`:
+`NOREPLACE` for first install and `EXCHANGE` for replacement. The exchanged
+identities are verified before the prior directory is removed; a failed or
+displaced exchange is reversed before its backup can be deleted.
 
 ## Development and verification
 

@@ -20,6 +20,11 @@ if rg -n 'localhost|npx|npm exec|deno run' \
   exit 1
 fi
 
+if rg -n 'mv -- .*\$STAGING_DIR|rollback\.\$\$' install.sh; then
+  echo "Installer contains a path-based or predictable swap primitive." >&2
+  exit 1
+fi
+
 git diff --check
 
 install_home="$(mktemp -d)"
@@ -33,6 +38,18 @@ if HOME="$install_home" ./install.sh --force >/dev/null 2>&1; then
   exit 1
 fi
 rm -rf -- "$collision"
+
+symlink_home="$(mktemp -d)"
+symlink_destination="$(mktemp -d)"
+ln -s "$symlink_destination" "$symlink_home/.config"
+if HOME="$symlink_home" ./install.sh >/dev/null 2>&1; then
+  echo "Installer accepted a symlinked destination ancestor." >&2
+  exit 1
+fi
+test ! -e "$symlink_destination/omarchy/plugins/io.github.tcballard.localwrap"
+rm "$symlink_home/.config"
+rmdir "$symlink_home" "$symlink_destination"
+
 HOME="$install_home" ./install.sh
 installed="$install_home/.config/omarchy/plugins/io.github.tcballard.localwrap"
 test -x "$installed/localwrap-helper"

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Install the LocalWrap Omarchy plugin from this repository checkout into the
 # user-owned Omarchy plugin directory. A complete verified payload is staged
-# beside the destination and atomically swapped, with rollback on interruption.
+# beside the destination and committed by the helper's locked, descriptor-
+# relative renameat2 transaction.
 #
 # Usage:
 #   ./install.sh [--force]
@@ -16,14 +17,9 @@ TARGET_DIR="${HOME}/.config/omarchy/plugins/${PLUGIN_ID}"
 PAYLOAD=(manifest.json BarWidget.qml Panel.qml Model.js localwrap-helper README.md LICENSE)
 TARGET_PARENT="$(dirname "$TARGET_DIR")"
 STAGING_DIR=""
-BACKUP_DIR=""
-SWAP_COMPLETE=0
 
 cleanup() {
   local status=$?
-  if [[ "$SWAP_COMPLETE" -ne 1 && -n "$BACKUP_DIR" && -d "$BACKUP_DIR" && ! -e "$TARGET_DIR" ]]; then
-    mv -- "$BACKUP_DIR" "$TARGET_DIR"
-  fi
   if [[ -n "$STAGING_DIR" && -d "$STAGING_DIR" ]]; then
     rm -rf -- "$STAGING_DIR"
   fi
@@ -57,24 +53,26 @@ for file in "${PAYLOAD[@]}"; do
   fi
 done
 
-if [[ -e "$TARGET_DIR" ]]; then
-  if [[ -L "$TARGET_DIR" || ! -d "$TARGET_DIR" ]]; then
-    echo "Refusing destination collision at ${TARGET_DIR}: expected a real directory." >&2
-    exit 1
+ensure_owned_directory() {
+  local path="$1"
+  if [[ -e "$path" ]]; then
+    if [[ -L "$path" || ! -d "$path" || ! -O "$path" ]]; then
+      echo "Refusing installation ancestor ${path}: expected a real user-owned directory." >&2
+      exit 1
+    fi
+  else
+    mkdir -- "$path"
+    if [[ -L "$path" || ! -d "$path" || ! -O "$path" ]]; then
+      echo "Could not create a real user-owned installation ancestor at ${path}." >&2
+      exit 1
+    fi
   fi
-  if [[ ! -f "$TARGET_DIR/manifest.json" ]] ||
-      ! grep -Eq '"id"[[:space:]]*:[[:space:]]*"io.github.tcballard.localwrap"' "$TARGET_DIR/manifest.json"; then
-    echo "Refusing to replace a directory not owned by ${PLUGIN_ID}." >&2
-    exit 1
-  fi
-  if [[ "$FORCE" -ne 1 ]]; then
-    echo "Already installed at ${TARGET_DIR}" >&2
-    echo "Re-run with --force to replace it." >&2
-    exit 1
-  fi
-fi
+}
 
-mkdir -p "$TARGET_PARENT"
+ensure_owned_directory "$HOME"
+ensure_owned_directory "$HOME/.config"
+ensure_owned_directory "$HOME/.config/omarchy"
+ensure_owned_directory "$TARGET_PARENT"
 STAGING_DIR="$(mktemp -d "${TARGET_PARENT}/.${PLUGIN_ID}.stage.XXXXXX")"
 for file in "${PAYLOAD[@]}"; do
   cp --no-preserve=ownership,timestamps -- "${SOURCE_DIR}/${file}" "${STAGING_DIR}/${file}"
@@ -89,20 +87,10 @@ chmod 0644 "${STAGING_DIR}/manifest.json" "${STAGING_DIR}/BarWidget.qml" \
   "${STAGING_DIR}/Panel.qml" "${STAGING_DIR}/Model.js" \
   "${STAGING_DIR}/README.md" "${STAGING_DIR}/LICENSE"
 
-if [[ -e "$TARGET_DIR" ]]; then
-  BACKUP_DIR="${TARGET_PARENT}/.${PLUGIN_ID}.rollback.$$"
-  if [[ -e "$BACKUP_DIR" ]]; then
-    echo "Refusing rollback-path collision at ${BACKUP_DIR}." >&2
-    exit 1
-  fi
-  mv -- "$TARGET_DIR" "$BACKUP_DIR"
-fi
-mv -- "$STAGING_DIR" "$TARGET_DIR"
+swap_result="$("${SOURCE_DIR}/localwrap-helper" install-swap "$STAGING_DIR" "$TARGET_DIR" "$FORCE")"
 STAGING_DIR=""
-SWAP_COMPLETE=1
-if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]]; then
-  rm -rf -- "$BACKUP_DIR"
-  BACKUP_DIR=""
+if [[ "$swap_result" != *'"backup":null'* ]]; then
+  echo "Warning: the verified install succeeded, but a displaced backup was retained for inspection." >&2
 fi
 
 echo "Installed ${PLUGIN_ID} to ${TARGET_DIR}"
