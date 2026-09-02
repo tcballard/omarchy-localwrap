@@ -9,6 +9,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -431,39 +432,82 @@ class HelperTests(unittest.TestCase):
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             try:
+                stat_fields = Path(f"/proc/{child_pid}/stat").read_text(encoding="ascii")
+                if stat_fields[stat_fields.rfind(")") + 2:].split()[0] == "Z":
+                    break
                 os.kill(child_pid, 0)
-            except ProcessLookupError:
+            except (FileNotFoundError, ProcessLookupError):
                 break
             time.sleep(0.05)
         else:
             self.fail("descendant survived helper TERM/deadline/KILL cleanup")
 
-    def test_natural_parent_exit_also_cleans_descendants(self) -> None:
+    def test_natural_parent_exit_with_inherited_pipes_is_bounded(self) -> None:
         child_pid_file = self.root / "orphan.pid"
         (self.root / "server.py").write_text(
             "import pathlib, subprocess, sys\n"
+            # Deliberately inherit stdout/stderr. The leader exits while this
+            # descendant keeps both helper-facing pipes open and ignores TERM,
+            # forcing the supervisor through its bounded KILL/drain path.
             "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
-            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            "stdin=subprocess.DEVNULL, "
+            "preexec_fn=lambda: __import__('signal').signal(__import__('signal').SIGTERM, "
+            "__import__('signal').SIG_IGN))\n"
             f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid))\n",
             encoding="utf-8",
         )
         self.write_manifest(manifest())
         plan = helper.launch_plan(self.root, "web")
+        started = time.monotonic()
         result = subprocess.run(
             [str(HELPER), "run", str(self.root), "web", plan["fingerprint"]],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=8, check=False,
         )
+        self.assertLess(time.monotonic() - started, 6)
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         child_pid = int(child_pid_file.read_text())
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             try:
+                stat_fields = Path(f"/proc/{child_pid}/stat").read_text(encoding="ascii")
+                if stat_fields[stat_fields.rfind(")") + 2:].split()[0] == "Z":
+                    break
                 os.kill(child_pid, 0)
-            except ProcessLookupError:
+            except (FileNotFoundError, ProcessLookupError):
                 break
             time.sleep(0.05)
         else:
             self.fail("descendant survived natural parent exit cleanup")
+
+    def test_reaped_leader_is_never_signalled(self) -> None:
+        child = subprocess.Popen(
+            [sys.executable, "-c", "pass"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        child.wait(timeout=5)
+        self.assertIsNotNone(child.returncode)
+        with mock.patch.object(os, "killpg") as killpg:
+            helper.terminate_group(child)
+        killpg.assert_not_called()
+
+    def test_term_deadline_kills_uncooperative_leader(self) -> None:
+        child = subprocess.Popen(
+            [
+                sys.executable, "-c",
+                "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print('ready', flush=True); time.sleep(60)",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        assert child.stdout is not None
+        self.assertEqual(child.stdout.readline(), b"ready\n")
+        started = time.monotonic()
+        helper.terminate_group(child)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertEqual(child.returncode, -signal.SIGKILL)
+        child.stdout.close()
 
 
 if __name__ == "__main__":

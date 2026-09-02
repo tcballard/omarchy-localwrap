@@ -2,7 +2,7 @@
 
 LocalWrap is an unsandboxed Omarchy plugin that intentionally starts local
 development servers. Repository manifests and process output are untrusted.
-Version 0.3.1 places both behind the bundled `localwrap-helper`; QML does not
+Version 0.3.2 places both behind the bundled `localwrap-helper`; QML does not
 read manifests or launch manifest commands directly.
 
 ## Marketplace remediation evidence
@@ -14,7 +14,7 @@ read manifests or launch manifest commands directly.
 | Symlink escape | Open repository descendants component-by-component with `O_NOFOLLOW`; retain the selected cwd descriptor through launch. | `test_repository_symlink_cannot_select_outside_cwd`, `test_interpreter_script_symlink_cannot_escape`, `test_working_directory_descriptor_survives_path_replacement` |
 | Unbounded JSON/QML materialization | Cap bytes and scan JSON depth before decode; enforce strict schemas plus project/workspace/dependency/member and string/argument limits; return only bounded normalized JSON to QML. | `test_manifest_limits_apply_before_materialization`, `test_schema_and_string_limits_are_enforced`, `test_config_is_bounded_deduplicated_and_atomically_written` |
 | Hostname probe boundary | Accept only numeric `127.0.0.1` or `[::1]` HTTP(S) URLs on explicit ports. | `test_numeric_loopback_only` and Node URL tests |
-| Descendant process survival | Start every command with `start_new_session=True`; TERM the process group, wait two seconds, then KILL on Stop/unload/interruption or natural leader exit. | `test_term_cleans_descendant_process_group`, `test_natural_parent_exit_also_cleans_descendants` |
+| Descendant process survival | Start every command with `start_new_session=True`; observe natural leader exit with non-reaping `waitid(..., WNOWAIT)`; TERM/KILL while the unreaped leader pins the PGID; drain inherited pipes only to a fixed deadline; never signal after `poll()`/`wait()` releases the identity. | `test_term_cleans_descendant_process_group`, `test_natural_parent_exit_with_inherited_pipes_is_bounded`, `test_reaped_leader_is_never_signalled` |
 | Unbounded live output | Drain in 4 KiB chunks; forward at most 64 KiB and 2 KiB per line before QML; retain only 20 bounded lines. | `test_output_is_capped_before_qml_receives_it`, Node tail test |
 | Rich-text interpretation | All QML `Text` instances use the `SafeText` component with `Text.PlainText`. | Static QML gate in `tests/run` |
 | Unsafe installer replacement | Verify the HOME-to-plugin ancestor chain with no-follow descriptors and user ownership; lock one held parent; stage a fixed SHA-256-verified payload; commit with descriptor-relative `renameat2(NOREPLACE/EXCHANGE)`; verify exchanged identities and reverse a failed/displaced exchange before backup deletion. | `test_install_noreplace_refuses_concurrent_destination_without_nesting` plus collision, ancestor-symlink, first-install, and replacement lifecycle gates in `tests/run` |

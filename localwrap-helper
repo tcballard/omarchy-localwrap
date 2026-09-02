@@ -49,6 +49,8 @@ MAX_FORWARDED_OUTPUT = 64 * 1024
 MAX_RESPONSE_BYTES = 128 * 1024
 MAX_OUTPUT_LINE = 2048
 STOP_GRACE_SECONDS = 2.0
+KILL_DRAIN_SECONDS = 0.5
+SUPERVISION_POLL_SECONDS = 0.05
 MANIFESTS = (".localwrap/workspace.json", "localwrap.json")
 ROOT_FIELDS = {"localwrap", "name", "projects", "workspaces"}
 PROJECT_FIELDS = {
@@ -965,26 +967,74 @@ def launch_plan(root: Path, project_id: str) -> dict[str, Any]:
 ACTIVE_CHILD: subprocess.Popen[bytes] | None = None
 
 
-def terminate_group(child: subprocess.Popen[bytes]) -> None:
-    def group_exists() -> bool:
-        try:
-            os.killpg(child.pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
+def leader_exited_unreaped(child: subprocess.Popen[bytes]) -> bool:
+    """Observe leader exit without releasing its PID/PGID identity."""
+    if child.returncode is not None:
+        return True
+    result = os.waitid(
+        os.P_PID, child.pid,
+        os.WEXITED | os.WNOHANG | os.WNOWAIT,
+    )
+    return result is not None
 
+
+def process_group_has_other_members(pgid: int, leader_pid: int) -> bool:
+    """Return conservatively whether /proc shows another member of pgid."""
     try:
-        os.killpg(child.pid, signal.SIGTERM)
-    except ProcessLookupError:
+        entries = os.scandir("/proc")
+    except OSError:
+        return True
+    with entries:
+        for entry in entries:
+            if not entry.name.isdecimal() or int(entry.name) == leader_pid:
+                continue
+            try:
+                value = Path(entry.path, "stat").read_text(encoding="ascii")
+                # comm is parenthesized and may contain spaces or parentheses.
+                remainder = value[value.rfind(")") + 2:].split()
+                if len(remainder) >= 3 and int(remainder[2]) == pgid:
+                    return True
+            except (OSError, UnicodeError, ValueError):
+                # A vanished process is harmless. Unreadable live entries are
+                # conservative because their group membership is unknown.
+                try:
+                    os.kill(int(entry.name), 0)
+                except (ProcessLookupError, ValueError):
+                    continue
+                except PermissionError:
+                    return True
+                else:
+                    return True
+    return False
+
+
+def signal_bound_group(child: subprocess.Popen[bytes], signum: int) -> None:
+    """Signal only while the unreaped leader still pins the numeric PGID."""
+    if child.returncode is not None:
         return
+    try:
+        os.killpg(child.pid, signum)
+    except ProcessLookupError:
+        pass
+
+
+def terminate_group(child: subprocess.Popen[bytes]) -> None:
+    # poll()/wait() release the PID identity. Never signal from a Popen that
+    # has already done so, because the bare numeric PGID could have been reused.
+    if child.returncode is not None:
+        return
+    signal_bound_group(child, signal.SIGTERM)
     deadline = time.monotonic() + STOP_GRACE_SECONDS
-    while group_exists() and time.monotonic() < deadline:
+    leader_exited = False
+    group_has_others = True
+    while time.monotonic() < deadline:
+        leader_exited = leader_exited_unreaped(child)
+        group_has_others = process_group_has_other_members(child.pid, child.pid)
+        if leader_exited and not group_has_others:
+            break
         time.sleep(0.05)
-    if group_exists():
-        try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+    if not leader_exited or group_has_others:
+        signal_bound_group(child, signal.SIGKILL)
     try:
         child.wait(timeout=1)
     except subprocess.TimeoutExpired:
@@ -1005,8 +1055,12 @@ def forward_bounded(child: subprocess.Popen[bytes], budget: int = MAX_FORWARDED_
         selector.register(stream, selectors.EVENT_READ)
     forwarded = 0
     pending = {child.stdout: b"", child.stderr: b""}
-    while selector.get_map():
-        for key, _mask in selector.select(timeout=0.2):
+    leader_exit_seen = False
+    term_deadline = 0.0
+    kill_deadline = 0.0
+    kill_sent = False
+    while True:
+        for key, _mask in selector.select(timeout=SUPERVISION_POLL_SECONDS):
             stream = key.fileobj
             try:
                 chunk = os.read(stream.fileno(), 4096)
@@ -1031,7 +1085,28 @@ def forward_bounded(child: subprocess.Popen[bytes], budget: int = MAX_FORWARDED_
                 sys.stdout.buffer.write(encoded)
                 sys.stdout.buffer.flush()
                 forwarded += len(encoded)
-        if child.poll() is not None and not selector.get_map():
+        now = time.monotonic()
+        if not leader_exit_seen and leader_exited_unreaped(child):
+            # The zombie leader continues to pin child.pid as this group's
+            # identity until all TERM/KILL decisions are complete.
+            leader_exit_seen = True
+            signal_bound_group(child, signal.SIGTERM)
+            term_deadline = now + STOP_GRACE_SECONDS
+        if not leader_exit_seen:
+            continue
+
+        group_has_others = process_group_has_other_members(child.pid, child.pid)
+        pipes_open = bool(selector.get_map())
+        if not group_has_others and not pipes_open:
+            break
+        if not kill_sent and now >= term_deadline:
+            # Send KILL even if a /proc snapshot saw no other member: a pipe
+            # holder may have raced that scan. The unreaped leader still pins
+            # the PGID, so this cannot target a reused numeric identity.
+            signal_bound_group(child, signal.SIGKILL)
+            kill_sent = True
+            kill_deadline = now + KILL_DRAIN_SECONDS
+        if kill_sent and (not pipes_open or now >= kill_deadline):
             break
     for data in pending.values():
         if data and forwarded < budget:
@@ -1040,10 +1115,12 @@ def forward_bounded(child: subprocess.Popen[bytes], budget: int = MAX_FORWARDED_
             sys.stdout.buffer.write(encoded)
             sys.stdout.buffer.flush()
             forwarded += len(encoded)
-    code = child.wait()
+    # Close any pipe held by an escaped or uncooperative descendant. All group
+    # signals happened above while the leader was intentionally unreaped.
     selector.close()
     child.stdout.close()
     child.stderr.close()
+    code = child.wait()
     return code, forwarded
 
 
@@ -1104,7 +1181,6 @@ def command_run(repository: str, project_id: str, fingerprint: str) -> None:
                     ACTIVE_CHILD, max(0, MAX_FORWARDED_OUTPUT - forwarded)
                 )
                 forwarded += used
-                terminate_group(ACTIVE_CHILD)
                 ACTIVE_CHILD = None
                 if code != 0:
                     break
