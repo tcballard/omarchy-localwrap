@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""Adversarial tests for LocalWrap's helper trust boundary."""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import signal
+import subprocess
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+HELPER = ROOT / "localwrap-helper"
+loader = importlib.machinery.SourceFileLoader("localwrap_helper", str(HELPER))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec is not None
+helper = importlib.util.module_from_spec(spec)
+loader.exec_module(helper)
+
+
+def manifest(project: dict | None = None) -> dict:
+    return {
+        "localwrap": 1,
+        "name": "Test",
+        "projects": [project or {
+            "id": "web",
+            "name": "Web",
+            "path": ".",
+            "command": "python3 server.py",
+            "port": 4301,
+            "url": "http://127.0.0.1:4301",
+        }],
+    }
+
+
+class HelperTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        (self.root / "server.py").write_text("print('ok')\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def write_manifest(self, value: dict) -> Path:
+        path = self.root / "localwrap.json"
+        path.write_text(json.dumps(value), encoding="utf-8")
+        return path
+
+    def test_numeric_loopback_only(self) -> None:
+        value = manifest()
+        value["projects"][0]["url"] = "http://localhost:4301"
+        self.write_manifest(value)
+        with self.assertRaisesRegex(helper.LocalWrapError, "numeric loopback"):
+            helper.parse_manifest(self.root)
+        value["projects"][0]["url"] = "http://[::1]:4301"
+        self.write_manifest(value)
+        _, parsed = helper.parse_manifest(self.root)
+        self.assertEqual(parsed["projects"][0]["url"], "http://[::1]:4301")
+
+    def test_dangerous_command_shapes_are_rejected(self) -> None:
+        rejected = [
+            "npx vite", "npm exec vite", "deno run app.ts", "python3 -c pass",
+            "node -e pass", "npm run dev -- --evil", "bash server.sh",
+        ]
+        for command in rejected:
+            with self.subTest(command=command):
+                with self.assertRaises(helper.LocalWrapError):
+                    helper.parse_command(command)
+        self.assertEqual(helper.parse_command("npm run dev"), ["npm", "run", "dev"])
+        self.assertEqual(helper.parse_command("python3 server.py"), ["python3", "server.py"])
+
+    def test_repository_symlink_cannot_select_outside_cwd(self) -> None:
+        outside = Path(self.temporary.name).parent / f"outside-{os.getpid()}"
+        outside.mkdir(exist_ok=True)
+        try:
+            (self.root / "escape").symlink_to(outside, target_is_directory=True)
+            value = manifest()
+            value["projects"][0]["path"] = "escape"
+            self.write_manifest(value)
+            with self.assertRaisesRegex(helper.LocalWrapError, "outside the repository"):
+                helper.parse_manifest(self.root)
+        finally:
+            outside.rmdir()
+
+    def test_interpreter_script_symlink_cannot_escape(self) -> None:
+        outside = Path(self.temporary.name).parent / f"outside-script-{os.getpid()}.py"
+        outside.write_text("print('outside')\n", encoding="utf-8")
+        try:
+            (self.root / "linked.py").symlink_to(outside)
+            value = manifest()
+            value["projects"][0]["command"] = "python3 linked.py"
+            self.write_manifest(value)
+            with self.assertRaisesRegex(helper.LocalWrapError, "outside the repository"):
+                helper.launch_plan(self.root, "web")
+        finally:
+            outside.unlink()
+
+    def test_manifest_limits_apply_before_materialization(self) -> None:
+        path = self.root / "localwrap.json"
+        path.write_bytes(b" " * (helper.MAX_MANIFEST_BYTES + 1))
+        with self.assertRaisesRegex(helper.LocalWrapError, "byte limit"):
+            helper.parse_manifest(self.root)
+        path.write_text("[" * (helper.MAX_JSON_DEPTH + 1) + "]" * (helper.MAX_JSON_DEPTH + 1), encoding="utf-8")
+        with self.assertRaisesRegex(helper.LocalWrapError, "depth limit"):
+            helper.parse_manifest(self.root)
+        value = manifest()
+        value["projects"] = value["projects"] * (helper.MAX_PROJECTS + 1)
+        self.write_manifest(value)
+        with self.assertRaisesRegex(helper.LocalWrapError, "project limit"):
+            helper.parse_manifest(self.root)
+
+    def test_schema_and_string_limits_are_enforced(self) -> None:
+        value = manifest()
+        value["unknown"] = True
+        self.write_manifest(value)
+        with self.assertRaisesRegex(helper.LocalWrapError, "unknown field"):
+            helper.parse_manifest(self.root)
+        value = manifest()
+        value["projects"][0]["name"] = "x" * (helper.MAX_NAME + 1)
+        self.write_manifest(value)
+        with self.assertRaisesRegex(helper.LocalWrapError, "character limit"):
+            helper.parse_manifest(self.root)
+        value = manifest()
+        value["projects"][0]["dependsOn"] = [f"p{i}" for i in range(helper.MAX_DEPENDENCIES + 1)]
+        self.write_manifest(value)
+        with self.assertRaisesRegex(helper.LocalWrapError, "dependency limit"):
+            helper.parse_manifest(self.root)
+
+    def test_exact_origin_change_invalidates_confirmation(self) -> None:
+        (self.root / "package.json").write_text(
+            json.dumps({"scripts": {
+                "predev": "python3 prepare.py", "dev": "vite --host 127.0.0.1",
+                "postdev": "python3 cleanup.py",
+            }}), encoding="utf-8"
+        )
+        value = manifest()
+        value["projects"][0]["command"] = "npm run dev"
+        self.write_manifest(value)
+        first = helper.launch_plan(self.root, "web")
+        self.assertIn("vite --host", first["reviewDetail"])
+        self.assertIn("predev", first["reviewDetail"])
+        self.assertIn("postdev", first["reviewDetail"])
+        (self.root / "package.json").write_text(
+            json.dumps({"scripts": {"dev": "vite --host 127.0.0.1 --strictPort"}}), encoding="utf-8"
+        )
+        second = helper.launch_plan(self.root, "web")
+        self.assertNotEqual(first["fingerprint"], second["fingerprint"])
+
+    def test_interpreter_script_content_change_invalidates_confirmation(self) -> None:
+        self.write_manifest(manifest())
+        first = helper.launch_plan(self.root, "web")
+        self.assertIn("sha256", first["reviewDetail"])
+        (self.root / "server.py").write_text("print('changed')\n", encoding="utf-8")
+        second = helper.launch_plan(self.root, "web")
+        self.assertNotEqual(first["fingerprint"], second["fingerprint"])
+
+    def test_config_is_bounded_deduplicated_and_atomically_written(self) -> None:
+        config_path = self.root / "config" / "repositories.json"
+        config = {"repositories": [str(self.root)], "notifications": False, "openOnReady": False}
+        helper.atomic_write_json(config_path, config)
+        self.assertEqual(helper.load_config(config_path)["repositories"], [str(self.root)])
+        mode = config_path.stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+        config_path.write_bytes(b" " * (helper.MAX_CONFIG_BYTES + 1))
+        with self.assertRaisesRegex(helper.LocalWrapError, "byte limit"):
+            helper.load_config(config_path)
+
+    def test_stale_configured_repository_remains_removable(self) -> None:
+        config_path = self.root / "config" / "repositories.json"
+        missing = self.root / "later-deleted"
+        helper.atomic_write_json(config_path, {
+            "repositories": [str(missing)], "notifications": False, "openOnReady": False,
+        })
+        loaded = helper.load_config(config_path)
+        self.assertEqual(loaded["repositories"], [str(missing)])
+        loaded["repositories"] = [
+            item for item in loaded["repositories"] if item != helper.configured_path(str(missing))
+        ]
+        helper.atomic_write_json(config_path, loaded)
+        self.assertEqual(helper.load_config(config_path)["repositories"], [])
+
+    def test_output_is_capped_before_qml_receives_it(self) -> None:
+        (self.root / "server.py").write_text(
+            "import sys\nsys.stdout.write('x' * 1000000)\nsys.stdout.flush()\n", encoding="utf-8"
+        )
+        self.write_manifest(manifest())
+        plan = helper.launch_plan(self.root, "web")
+        result = subprocess.run(
+            [str(HELPER), "run", str(self.root), "web", plan["fingerprint"]],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertLessEqual(len(result.stdout), helper.MAX_OUTPUT_LINE + 1)
+
+    def test_term_cleans_descendant_process_group(self) -> None:
+        child_pid_file = self.root / "child.pid"
+        (self.root / "server.py").write_text(
+            "import pathlib, subprocess, sys, time\n"
+            "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid))\n"
+            "time.sleep(60)\n",
+            encoding="utf-8",
+        )
+        self.write_manifest(manifest())
+        plan = helper.launch_plan(self.root, "web")
+        process = subprocess.Popen(
+            [str(HELPER), "run", str(self.root), "web", plan["fingerprint"]],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 5
+        while not child_pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(child_pid_file.exists())
+        child_pid = int(child_pid_file.read_text())
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=5)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("descendant survived helper TERM/deadline/KILL cleanup")
+
+    def test_natural_parent_exit_also_cleans_descendants(self) -> None:
+        child_pid_file = self.root / "orphan.pid"
+        (self.root / "server.py").write_text(
+            "import pathlib, subprocess, sys\n"
+            "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid))\n",
+            encoding="utf-8",
+        )
+        self.write_manifest(manifest())
+        plan = helper.launch_plan(self.root, "web")
+        result = subprocess.run(
+            [str(HELPER), "run", str(self.root), "web", plan["fingerprint"]],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=8, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        child_pid = int(child_pid_file.read_text())
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("descendant survived natural parent exit cleanup")
+
+
+if __name__ == "__main__":
+    unittest.main()

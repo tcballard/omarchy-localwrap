@@ -19,7 +19,7 @@ const DOCS_EXAMPLE = JSON.stringify({
     projects: [
         {
             autostart: false,
-            command: "pnpm dev",
+            command: "pnpm run dev",
             dependsOn: ["api"],
             healthCheck: { path: "/health" },
             id: "web",
@@ -27,7 +27,7 @@ const DOCS_EXAMPLE = JSON.stringify({
             openOnReady: true,
             path: "apps/web",
             port: 3000,
-            url: "http://localhost:3000",
+            url: "http://127.0.0.1:3000",
         },
         {
             command: "npm run dev",
@@ -47,12 +47,12 @@ function codes(result) {
     return result.errors.map((diagnostic) => diagnostic.code).sort();
 }
 
-test("parseCommand accepts allowlisted executables and splits arguments", () => {
-    const parsed = Model.parseCommand("  pnpm  dev --host  ");
+test("parseCommand accepts an exact local package script", () => {
+    const parsed = Model.parseCommand("  pnpm  run dev  ");
     assert.equal(parsed.ok, true);
     assert.equal(parsed.executable, "pnpm");
-    assert.deepEqual(parsed.arguments, ["dev", "--host"]);
-    assert.equal(Model.formatCommand(parsed), "pnpm dev --host");
+    assert.deepEqual(parsed.arguments, ["run", "dev"]);
+    assert.equal(Model.formatCommand(parsed), "pnpm run dev");
 });
 
 test("parseCommand rejects executables outside the allowlist", () => {
@@ -81,12 +81,11 @@ test("parseCommand rejects every documented shell metacharacter", () => {
     assert.equal(Model.parseCommand("   ").ok, false);
 });
 
-test("validateLoopbackURL accepts the three loopback hosts with explicit ports", () => {
+test("validateLoopbackURL accepts numeric loopback hosts with explicit ports", () => {
     for (const url of [
-        "http://localhost:3000",
+        "http://127.0.0.1:3000",
         "https://127.0.0.1:8443/path?q=1#frag",
         "http://[::1]:4000/health",
-        "HTTP://LOCALHOST:3000",
     ]) {
         const validated = Model.validateLoopbackURL(url);
         assert.equal(validated.ok, true, url);
@@ -102,6 +101,7 @@ test("validateLoopbackURL accepts the three loopback hosts with explicit ports",
 test("validateLoopbackURL rejects everything outside the loopback contract", () => {
     const rejected = [
         "http://localhost",            // no port
+        "http://localhost:3000",       // hostname is not a network boundary
         "http://localhost:999",        // port below 1000
         "http://localhost:70000",      // port above 65535
         "http://example.com:3000",     // non-loopback host
@@ -120,14 +120,14 @@ test("validateLoopbackURL rejects everything outside the loopback contract", () 
 });
 
 test("resolveHealthCheck follows path/url exclusivity and strips query and fragment", () => {
-    const fromPath = Model.resolveHealthCheck("http://localhost:3000/app?x=1#y", { path: "/health" });
-    assert.deepEqual(fromPath, { ok: true, url: "http://localhost:3000/health" });
+    const fromPath = Model.resolveHealthCheck("http://127.0.0.1:3000/app?x=1#y", { path: "/health" });
+    assert.deepEqual(fromPath, { ok: true, url: "http://127.0.0.1:3000/health" });
 
-    const fromURL = Model.resolveHealthCheck("http://localhost:3000", { url: "http://127.0.0.1:3100/ping" });
+    const fromURL = Model.resolveHealthCheck("http://127.0.0.1:3000", { url: "http://127.0.0.1:3100/ping" });
     assert.deepEqual(fromURL, { ok: true, url: "http://127.0.0.1:3100/ping" });
 
-    const fallback = Model.resolveHealthCheck("http://localhost:3000/app", null);
-    assert.deepEqual(fallback, { ok: true, url: "http://localhost:3000/app" });
+    const fallback = Model.resolveHealthCheck("http://127.0.0.1:3000/app", null);
+    assert.deepEqual(fallback, { ok: true, url: "http://127.0.0.1:3000/app" });
 
     assert.equal(Model.resolveHealthCheck("http://localhost:3000", { path: "/a", url: "http://localhost:3000/b" }).ok, false);
     assert.equal(Model.resolveHealthCheck("http://localhost:3000", {}).ok, false);
@@ -170,11 +170,11 @@ test("parseWorkspaceManifest accepts the documentation example verbatim", () => 
     assert.equal(web.id, "web");
     assert.equal(web.name, "Web");
     assert.equal(web.path, "apps/web");
-    assert.equal(web.commandLine, "pnpm dev");
+    assert.equal(web.commandLine, "pnpm run dev");
     assert.equal(web.port, 3000);
-    assert.equal(web.url, "http://localhost:3000");
+    assert.equal(web.url, "http://127.0.0.1:3000");
     assert.deepEqual(web.dependsOn, ["api"]);
-    assert.equal(web.healthCheckURL, "http://localhost:3000/health");
+    assert.equal(web.healthCheckURL, "http://127.0.0.1:3000/health");
     assert.equal(web.autostart, false);
     assert.equal(web.openOnReady, true);
 
@@ -200,8 +200,8 @@ test("parseWorkspaceManifest applies the documented defaults", () => {
     assert.equal(project.name, "project-1");
     assert.equal(project.path, ".");
     assert.equal(project.port, 3000);
-    assert.equal(project.url, "http://localhost:3000");
-    assert.equal(project.healthCheckURL, "http://localhost:3000");
+    assert.equal(project.url, "http://127.0.0.1:3000");
+    assert.equal(project.healthCheckURL, "http://127.0.0.1:3000");
     assert.equal(project.autostart, false);
     assert.equal(project.openOnReady, true);
 });
@@ -234,6 +234,24 @@ test("parseWorkspaceManifest requires version 1 and at least one project", () =>
         .includes("manifest-invalid-json"));
     assert.ok(codes(Model.parseWorkspaceManifest("[1]", "r"))
         .includes("manifest-not-object"));
+});
+
+test("parseWorkspaceManifest rejects byte, depth, project, and dependency limits", () => {
+    assert.ok(codes(Model.parseWorkspaceManifest(" ".repeat(65537), "r"))
+        .includes("manifest-too-large"));
+    const deep = "[".repeat(13) + "]".repeat(13);
+    assert.ok(codes(Model.parseWorkspaceManifest(deep, "r"))
+        .includes("manifest-too-deep"));
+    const projects = Array.from({ length: 33 }, (_, index) => ({
+        id: `p${index}`, command: "npm start",
+    }));
+    assert.ok(codes(Model.parseWorkspaceManifest(JSON.stringify({ localwrap: 1, projects }), "r"))
+        .includes("projects-limit"));
+    const dependencies = Array.from({ length: 17 }, (_, index) => `p${index}`);
+    const limited = Model.parseWorkspaceManifest(JSON.stringify({
+        localwrap: 1, projects: [{ id: "main", command: "npm start", dependsOn: dependencies }],
+    }), "r");
+    assert.ok(codes(limited).includes("depends-on-limit"));
 });
 
 test("parseWorkspaceManifest validates commands, ports, urls, and paths per project", () => {
@@ -330,7 +348,7 @@ test("parseWorkspaceManifest validates workspace groupings", () => {
 test("parseWorkspaceManifest warns without blocking on url/port mismatch", () => {
     const result = Model.parseWorkspaceManifest(JSON.stringify({
         localwrap: 1,
-        projects: [{ id: "a", command: "npm start", port: 3000, url: "http://localhost:3001" }],
+        projects: [{ id: "a", command: "npm start", port: 3000, url: "http://127.0.0.1:3001" }],
     }), "r");
     assert.equal(result.ok, true);
     assert.equal(result.warnings.length, 1);
@@ -384,10 +402,11 @@ test("canStart gates on dependencies being ready and on current status", () => {
 });
 
 test("readiness probe mirrors the app's HEAD/1s/<500 contract", () => {
-    assert.deepEqual(Model.curlProbeArgv("http://localhost:3000/health"), [
-        "curl", "-s", "-o", "/dev/null", "-I",
+    assert.deepEqual(Model.curlProbeArgv("http://127.0.0.1:3000/health"), [
+        "curl", "-q", "--noproxy", "*", "--proto", "=http,https",
+        "-s", "-o", "/dev/null", "-I",
         "-w", "%{http_code}", "--max-time", "1",
-        "http://localhost:3000/health",
+        "http://127.0.0.1:3000/health",
     ]);
     assert.equal(Model.isReadyHttpCode("200"), true);
     assert.equal(Model.isReadyHttpCode("404\n"), true);
@@ -406,6 +425,16 @@ test("appendOutputTail keeps a bounded, newline-split tail", () => {
     tail = Model.appendOutputTail(tail, "line4\nline5", 4);
     assert.deepEqual(tail, ["line2", "line3", "line4", "line5"]);
     assert.deepEqual(Model.appendOutputTail([], "", 4), []);
+    assert.equal(Model.appendOutputTail([], "x".repeat(5000), 4)[0].length, 2048);
+});
+
+test("parseRepositoriesConfig rejects byte, depth, and repository-count limits", () => {
+    assert.equal(Model.parseRepositoriesConfig(" ".repeat(16385), "/home/me").ok, false);
+    assert.equal(Model.parseRepositoriesConfig("[".repeat(13) + "]".repeat(13), "/home/me").ok, false);
+    const repositories = Array.from({ length: 17 }, (_, index) => `/repo/${index}`);
+    const result = Model.parseRepositoriesConfig(JSON.stringify({ repositories }), "/home/me");
+    assert.equal(result.ok, false);
+    assert.equal(result.errors[0].code, "config-repositories-limit");
 });
 
 test("path helpers behave on edges", () => {
@@ -534,9 +563,9 @@ test("notifications cover notable transitions only and build a safe argv", () =>
     assert.equal(Model.notificationForTransition("Web", S.stopped, ""), null);
 
     assert.deepEqual(Model.notifySendArgv("Web is ready", "http://localhost:3000"),
-        ["notify-send", "-a", "LocalWrap", "Web is ready", "http://localhost:3000"]);
+        ["notify-send", "-a", "LocalWrap", "--", "Web is ready", "http://localhost:3000"]);
     assert.deepEqual(Model.notifySendArgv("Web failed", ""),
-        ["notify-send", "-a", "LocalWrap", "Web failed"]);
+        ["notify-send", "-a", "LocalWrap", "--", "Web failed"]);
 });
 
 test("dirCheckArgv wraps test -d", () => {
