@@ -2,94 +2,66 @@
 
 **Your local development workspace, controlled from the Quattro bar.**
 
-LocalWrap is an Omarchy bar widget for developers running multi-service projects. It reads a repository-owned LocalWrap manifest and gives you one cockpit to start dependencies in order, watch readiness, stop services, and open their loopback apps. Reading remains passive: nothing runs until you press **Start**.
-
-Install it on Omarchy Quattro:
+LocalWrap is an Omarchy bar widget for developers running multi-service
+projects. It reads a repository-owned LocalWrap manifest and gives you one
+cockpit to review exact commands, start dependencies in order, watch readiness,
+stop complete process groups, and open numeric-loopback apps.
 
 ```sh
 omarchy plugin add https://github.com/tcballard/omarchy-localwrap.git --enable
 ```
 
-**Confirmed on Quattro.** The same portable model used by the QML interface is covered by [32 Node tests](tests/model.test.js), and the repository includes a [dependency-free demo workspace](examples/demo) for exercising startup order and readiness.
+The QML model and bounded runtime helper have 47 portable regression tests,
+including adversarial command, symlink, input-limit, process-group, output-cap,
+and atomic-configuration cases. A dependency-free [demo workspace](examples/demo)
+is included for live Quattro acceptance.
 
 ## What it does
 
-- Bar widget shows `LW ready/total` for every configured project (`!` marks
-  projects that need attention). Click it to open the cockpit panel.
-- The panel lists each configured repository's projects with status, command,
-  and URL. Reading a repository never runs anything: **Start** is the only
-  execution action.
-- Start launches the manifest command directly (no shell), with `PORT` set,
-  in the project's directory; readiness is confirmed by probing the project's
-  health-check URL every 500 ms for up to 30 s (HEAD request, 1 s budget, any
-  HTTP status below 500 counts as ready) — the same contract as the app.
-- Before starting, the plugin verifies the executable exists and probes the
-  health URL; if something already responds, it reports a conflict instead of
-  starting a second copy.
-- **Open** hands the project's validated loopback URL to your default
-  browser. **Stop** terminates the process the plugin started.
-- Projects with `dependsOn` stay gated until their dependencies are Ready.
-- Manifest `workspaces` get **Start all** / **Stop all**: starting brings up
-  the grouping's members plus their transitive dependencies in dependency
-  order, waiting for each dependency to become Ready; stopping works in
-  reverse. A member that fails, conflicts, or stalls halts the run with a
-  visible reason.
-- Configuration and manifest edits are picked up automatically (mtime
-  polling every 5 s); a reload never touches running processes. **Rescan**
-  remains for immediate refresh.
-- Opt-in desktop notifications (`notify-send`) on Ready, Failed, port
-  conflict, and not-ready-in-time transitions — status only, never command
-  output.
-- Opt-in auto-open on Ready: only when your configuration enables
-  `openOnReady` *and* the project's manifest sets `openOnReady`.
-- A running process whose manifest entry disappears after a rescan stays
-  listed until you stop it — the plugin never loses track of a process it
-  started.
+- Shows `LW ready/total` in the bar; `!` marks projects needing attention.
+- Adds and removes local repositories directly in the panel. No hand-edited
+  configuration file is required after a standard install.
+- Reads repository manifests passively. Nothing autostarts.
+- **Start** first shows the exact command, resolved executable, real working
+  directory, and local command origin. Only **Confirm & Start** authorizes that
+  exact fingerprint once; any origin change requires a new review.
+- Starts dependencies in order and supports workspace **Start all** / **Stop
+  all** orchestration. Each command still receives its own review confirmation.
+- Probes a numeric-loopback health URL every 500 ms for up to 30 seconds.
+- Opens only validated numeric-loopback project URLs.
+- Watches configuration and manifests for changes without touching running
+  processes.
+- Optionally sends status-only desktop notifications and opens a project when
+  ready if both configuration and manifest opt in.
+- Keeps a removed manifest entry visible until its live process group is
+  stopped.
 
 ## Requirements
 
 - Omarchy with the Quattro shell (plugin `schemaVersion` 1).
-- `curl` (readiness probes), `which`, `test`, and `stat` (coreutils) —
-  present on any Omarchy install.
-- `notify-send` (libnotify), only if you enable notifications.
-- The runtimes your manifests use (`npm`, `pnpm`, `bun`, …) on `PATH`.
-
-## Install
-
-```sh
-omarchy plugin add https://github.com/tcballard/omarchy-localwrap.git --enable
-```
-
-Place the widget where you want it:
-
-```sh
-omarchy bar move io.github.tcballard.localwrap --section right
-```
+- Python 3 for the bundled bounded parser/process supervisor.
+- `curl` for readiness probes and `stat` for manifest watching.
+- `notify-send` only if notifications are enabled.
+- The runtime used by each reviewed project command.
 
 ## Configure
 
-Create `~/.config/localwrap/repositories.json` listing the repositories whose
-manifests you trust:
+Open LocalWrap from the Quattro bar, enter an existing local repository path,
+and press **Add**. The helper resolves and stores the real path atomically.
+
+Advanced users may manage `~/.config/localwrap/repositories.json` directly:
 
 ```json
 {
-  "repositories": [
-    "~/src/storefront",
-    "/home/you/src/blog"
-  ],
+  "repositories": ["/home/you/src/storefront"],
   "notifications": false,
   "openOnReady": false
 }
 ```
 
-Both optional flags default to off. `notifications` sends desktop
-notifications on runtime transitions. `openOnReady` lets a project open in
-your browser when it becomes ready — and even then only for projects whose
-manifest also sets `"openOnReady": true`, so both you and the manifest
-author must opt in.
+Both optional flags default off. At most 16 repositories are accepted.
 
-Each repository needs a LocalWrap workspace manifest, for example
-`.localwrap/workspace.json`:
+Each repository needs `.localwrap/workspace.json` or `localwrap.json`:
 
 ```json
 {
@@ -97,96 +69,102 @@ Each repository needs a LocalWrap workspace manifest, for example
   "projects": [
     {
       "id": "web",
-      "command": "pnpm dev",
+      "command": "pnpm run dev",
       "path": "apps/web",
       "port": 3000,
+      "url": "http://127.0.0.1:3000",
       "healthCheck": { "path": "/health" }
     }
   ]
 }
 ```
 
-See the [manifest v1 guide](https://github.com/tcballard/LocalWrap/blob/main/Documentation/workspace-manifest-v1.md)
-and [JSON Schema](https://github.com/tcballard/LocalWrap/blob/main/Documentation/schema/workspace-manifest-v1.schema.json)
-for every field. Edits to either file are picked up automatically within a
-few seconds; **Rescan** in the panel forces an immediate refresh.
+`localhost` is deliberately rejected. Use `127.0.0.1` or `[::1]` in project
+and health-check URLs. If `url` is omitted it defaults to numeric IPv4 loopback.
 
-## Usage
+## Execution review
 
-Click the `LW` widget to open the cockpit. Each project row shows a status
-dot (gray stopped, yellow starting, green ready, orange running-but-not-ready,
-red failed or port conflict), the exact command it will run, and its URL.
-Start, Stop, and Open act on that row alone; Escape closes the panel.
+A repository manifest may propose execution; it cannot authorize execution.
+When Start is pressed, LocalWrap resolves and displays:
 
-Below a repository's projects, its manifest `workspaces` appear with their
-computed start order (`db → api → web`) and a ready count. **Start all**
-walks that order, starting each project once its dependencies are Ready;
-**Stop all** stops the grouping in reverse. If a member fails on the way up,
-the run halts and the row says why.
+- the exact manifest command;
+- the installed executable's canonical path;
+- the real, repository-contained working directory;
+- the manifest path; and
+- either the exact local `package.json` script or the real interpreter script.
+
+Confirm only if you trust that repository and exact command. The helper creates
+a SHA-256 fingerprint over the complete launch plan and rebuilds it immediately
+before execution. A changed manifest, package script, executable, path, or
+symlink fails closed and requires review again.
 
 ## Security model
 
-Omarchy plugins run unsandboxed inside the shared shell process, so this
-plugin keeps LocalWrap's fail-closed rules:
+Omarchy plugins run unsandboxed in the shared shell, so LocalWrap treats every
+repository and all live output as hostile input.
 
-- Manifest commands are restricted to the v1 executable allowlist
-  (`npm npx yarn pnpm node bun python python3 deno`), rejected if they contain
-  shell metacharacters, and launched directly — never through a shell.
-- URLs (project and health check) must be loopback `http(s)` on
-  `localhost`, `127.0.0.1`, or `[::1]` with an explicit port from 1000–65535;
-  only validated URLs are probed or opened.
-- Unknown manifest fields are blockers, which refuses secret-bearing
-  extensions (`environment`, `secrets`, `tokens`, …) exactly like the app.
-- Nothing autostarts. Reading configuration and manifests is passive;
-  `autostart` in a manifest is parsed but deliberately not acted on.
-- The only external commands the plugin runs are `cat` (read config and
-  manifests), `which` (confirm an executable exists), `test -d` (confirm the
-  project directory exists), `curl` (loopback readiness probes), `stat`
-  (poll config/manifest mtimes), `notify-send` (only when notifications are
-  enabled), and the reviewed project commands you explicitly start. All are
-  invoked with fixed argument lists, never through a shell.
-- Process output is kept only in memory (a bounded tail shown on failure)
-  and never written to disk.
+### Commands and origins
 
-## Lifecycle and limitations
+- `npx`, `npm exec`, `deno run`, eval flags, shell operators, quoting, and
+  arbitrary interpreter paths are rejected.
+- Package managers permit only `<npm|pnpm|yarn|bun> run <name>` plus
+  `npm start`. The exact local package script is part of the review fingerprint.
+- Node and Python require a real repository-contained script path.
+- Support commands use fixed argument arrays. Manifest text is never passed to
+  a shell by QML.
 
-- Started processes are children of the Omarchy shell. Disabling or removing
-  the plugin, or restarting the shell, terminates them. Stop signals the
-  direct child process; runners like `npm` forward termination to their
-  children.
-- A project that is running but not ready within 30 s is marked
-  "Running, not ready" and left running for you to inspect or stop.
-- A halted workspace run (a member failed, conflicted, stalled, or left the
-  manifest) stays halted with its reason until you press **Start all** again;
-  automatic reloads never restart or stop anything on their own.
-- Manifest path containment is enforced lexically (`..` may not escape the
-  repository); the macOS app additionally resolves symlinks on disk.
-- If the bar instantiates widgets per monitor, each instance manages its own
-  processes; the pre-start conflict probe prevents double-starting the same
-  port.
+### Files and bounded parsing
 
-## Development
+- Repository roots, manifests, working directories, package files, and scripts
+  are resolved on disk and must remain within the real repository root.
+- Manifests and package files themselves may not be symlinks.
+- Configuration is capped at 16 KiB and manifests at 64 KiB before decoding.
+- JSON depth is capped at 12 before `json.loads`/`JSON.parse` materialization.
+- A manifest permits at most 32 projects, 16 workspaces, 16 dependencies per
+  project, and 32 members per workspace.
+- IDs/names are capped at 128 characters, paths at 256, commands/URLs at 512,
+  and command argument count/length at 32/256.
+- Unknown schema fields are blockers.
 
-Work in a user-owned copy, per the
-[plugin development guide](https://omarchyplugins.com/develop.html). From a
-checkout of this repository, `./install.sh` copies the payload into
-`~/.config/omarchy/plugins/io.github.tcballard.localwrap/` (files only, no
-symlinks; it never enables or starts anything).
+### Network, processes, output, and rendering
 
-[`examples/demo`](examples/demo) is a dependency-free two-project workspace
-(api with a visible warmup delay, web gated on it via `dependsOn`, a
-`Full stack` workspace) for exercising every feature on a real machine —
-including orchestration, conflict refusal, and failure tails. Its README has
-a suggested walk-through.
+- Project and probe URLs must be `http(s)` on numeric `127.0.0.1` or `[::1]`
+  with an explicit port from 1000–65535. Hostnames, wildcard/LAN addresses,
+  userinfo, and other schemes are rejected.
+- Every server runs in an independent process group. Stop, plugin unload, or
+  interruption sends TERM to the group, waits two seconds, then sends KILL.
+- The helper drains child pipes in 4 KiB chunks, forwards at most 64 KiB total,
+  and truncates each line at 2 KiB before QML receives it. The final bounded
+  tail stays in memory and is never persisted.
+- Every manifest-derived label, diagnostic, command, path, URL, notification,
+  and process-output line uses explicit `Text.PlainText` rendering.
 
-Pure logic lives in `Model.js`, shared verbatim between the QML entry points
-and the node test suite:
+### Installation
+
+The normal `omarchy plugin add` path is preferred. For a checkout, `install.sh`
+provides the same payload safely:
+
+```sh
+./install.sh
+# Existing owned installation only:
+./install.sh --force
+```
+
+The installer rejects source/destination symlinks and ownership collisions,
+stages the complete fixed payload beside the destination, verifies every
+copied SHA-256, applies fixed modes, and atomically swaps it. An interrupted
+replacement restores the previous complete directory.
+
+## Development and verification
 
 ```sh
 node --test tests/model.test.js
+python3 -m unittest -v tests/test_helper.py
+bash -n install.sh
+git diff --check
 ```
 
-Validate the installed folder on an Omarchy machine:
+On Omarchy:
 
 ```sh
 omarchy plugin validate ~/.config/omarchy/plugins/io.github.tcballard.localwrap
@@ -195,33 +173,14 @@ qmllint -I "$OMARCHY_PATH/shell" \
   ~/.config/omarchy/plugins/io.github.tcballard.localwrap/Panel.qml
 ```
 
-## Troubleshooting
-
-- **Widget missing after install** — run `omarchy-shell shell rescanPlugins`,
-  then `omarchy plugin list --json` to confirm discovery and enablement.
-- **Panel shows "No repositories configured"** — create
-  `~/.config/localwrap/repositories.json` as above, then Rescan.
-- **Repository shows blockers** — the manifest violates the v1 contract; the
-  diagnostics name the field. The macOS app's `LocalWrap validate-manifest`
-  prints the same class of findings.
-- **Start is dimmed with "Waiting on …"** — a `dependsOn` project is not
-  Ready yet; start dependencies first.
-- **Component fails to load** — inspect
-  `qs log -p "$OMARCHY_PATH/shell" --tail 100` for QML errors.
-
 ## Remove
 
 ```sh
 omarchy plugin remove io.github.tcballard.localwrap
 ```
 
-Removal stops anything the plugin started. Your repositories, manifests, and
-`~/.config/localwrap/repositories.json` are untouched.
-
-## Roadmap
-
-- Submission to the [Omarchy plugin marketplace](https://omarchyplugins.com).
-- Richer per-project diagnostics (closer to the macOS app's Project Doctor).
+Removal stops supervised process groups. Repositories, manifests, and
+`~/.config/localwrap/repositories.json` are left untouched.
 
 ## License
 

@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+node --test tests/model.test.js
+python3 -m unittest -v tests/test_helper.py
+python3 -m py_compile localwrap-helper
+bash -n install.sh
+
+if rg -n '(^|delegate:[[:space:]]+)Text[[:space:]]*\{' Panel.qml; then
+  echo "Panel.qml contains a Text surface that bypasses SafeText/Text.PlainText." >&2
+  exit 1
+fi
+
+if rg -n 'localhost|npx|npm exec|deno run' \
+    Panel.qml Model.js examples/demo/.localwrap/workspace.json; then
+  echo "Runtime source or demo contains a forbidden hostname/command surface." >&2
+  exit 1
+fi
+
+git diff --check
+
+install_home="$(mktemp -d)"
+cleanup() { rm -rf -- "$install_home"; }
+trap cleanup EXIT INT TERM
+collision="$install_home/.config/omarchy/plugins/io.github.tcballard.localwrap"
+mkdir -p "$collision"
+printf '%s\n' '{"id":"someone.elses.plugin"}' > "$collision/manifest.json"
+if HOME="$install_home" ./install.sh --force >/dev/null 2>&1; then
+  echo "Installer replaced an unowned destination collision." >&2
+  exit 1
+fi
+rm -rf -- "$collision"
+HOME="$install_home" ./install.sh
+installed="$install_home/.config/omarchy/plugins/io.github.tcballard.localwrap"
+test -x "$installed/localwrap-helper"
+test "$(find "$installed" -maxdepth 1 -type f | wc -l)" -eq 7
+HOME="$install_home" ./install.sh --force
+test -x "$installed/localwrap-helper"
+
+echo "LocalWrap portable verification passed."

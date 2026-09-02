@@ -7,20 +7,15 @@ import "Model.js" as Model
 
 // LocalWrap cockpit panel.
 //
-// Reads the repository list from ~/.config/localwrap/repositories.json, then
-// each repository's LocalWrap workspace manifest (.localwrap/workspace.json,
-// falling back to localwrap.json). Reading is always passive: nothing starts
-// until the user presses Start on a reviewed row.
+// The bundled localwrap-helper is the trust boundary for bounded parsing,
+// realpath containment, exact launch review, and process-group cleanup. QML
+// consumes only its bounded normalized JSON and never executes manifest text.
 //
 // External commands used, all with fixed argument lists built in Model.js:
-//   cat          read the configuration and manifest files
-//   which        confirm a manifest executable exists before launching it
-//   test -d      confirm the project directory exists before launching
+//   localwrap-helper  bounded config/manifest inspection and confirmed launch
 //   curl         probe the loopback health-check URL (HEAD, 1 s budget)
 //   stat         poll config/manifest mtimes so edits are picked up
 //   notify-send  desktop notifications, only when enabled in configuration
-// Project commands themselves are restricted to the LocalWrap executable
-// allowlist and are launched directly — never through a shell.
 Panel {
   id: root
   moduleName: "io.github.tcballard.localwrap"
@@ -47,10 +42,15 @@ Panel {
   property var orchestrations: ({})
   // Last observed config/manifest mtimes; null until the first watch poll.
   property var watchTimes: null
+  // One exact launch plan at a time. The user must inspect and confirm it;
+  // the helper re-fingerprints every origin immediately before execution.
+  property var pendingReview: null
+  property string setupMessage: ""
 
   readonly property string homeDirectory: Quickshell.env("HOME") || ""
   readonly property string configPath:
     homeDirectory + "/.config/localwrap/repositories.json"
+  readonly property string helperPath: localPath(Qt.resolvedUrl("localwrap-helper"))
   readonly property int maxTailLines: 20
 
   readonly property var summary: computeSummary(repositories, runtimes)
@@ -58,6 +58,23 @@ Panel {
   readonly property string barTooltip: Model.barTooltip(summary)
   readonly property bool anyStarting: computeAnyStarting(runtimes)
   readonly property var orphans: computeOrphans(repositories, runtimes)
+
+  function localPath(url) {
+    var value = String(url)
+    return value.indexOf("file://") === 0 ? decodeURIComponent(value.slice(7)) : value
+  }
+
+  function parseHelperJSON(text) {
+    // The helper already caps UTF-8 output at 128 KiB; enforce the same
+    // character ceiling again before JSON.parse as defense in depth.
+    if (typeof text !== "string" || text.length > 131072) return null
+    try {
+      var value = JSON.parse(text)
+      return value !== null && typeof value === "object" ? value : null
+    } catch (_error) {
+      return null
+    }
+  }
 
   function open() {
     root.controller.show()
@@ -97,24 +114,17 @@ Panel {
       configLoaded = true
       return
     }
-    runRead(["cat", configPath], function(exitCode, text) {
+    runRead([helperPath, "config-get", configPath], function(exitCode, text) {
       if (generation !== root.loadGeneration) return
       root.configLoaded = true
-      if (exitCode !== 0) {
-        root.configError = "missing-config"
-        return
-      }
-      var parsed = Model.parseRepositoriesConfig(text, root.homeDirectory)
-      if (!parsed.ok) {
-        root.configError = diagnosticsText(parsed.errors)
+      var parsed = parseHelperJSON(text)
+      if (exitCode !== 0 || parsed === null || parsed.ok !== true) {
+        root.configError = "Configuration could not be read safely."
         return
       }
       root.configNotifications = parsed.notifications === true
       root.configOpenOnReady = parsed.openOnReady === true
-      if (parsed.repositories.length === 0) {
-        root.configError = "missing-config"
-        return
-      }
+      if (parsed.repositories.length === 0) root.configError = "missing-config"
       // Placeholders keep the listing in configuration order even though
       // manifest reads complete asynchronously.
       var placeholders = []
@@ -138,49 +148,52 @@ Panel {
   }
 
   function loadRepository(repositoryRoot, generation) {
-    tryManifest(repositoryRoot, Model.manifestCandidatePaths(repositoryRoot), 0, generation)
-  }
-
-  function tryManifest(repositoryRoot, candidates, index, generation) {
-    if (index >= candidates.length) {
-      replaceRepository({
-        root: repositoryRoot,
-        name: Model.basename(repositoryRoot),
-        manifestPath: null,
-        ok: false,
-        errors: [{
-          code: "manifest-missing", scope: "repository",
-          message: "No " + Model.MANIFEST_RELATIVE_PATHS.join(" or ") + " found.",
-        }],
-        warnings: [],
-        projects: [],
-        workspaces: [],
-      })
-      return
-    }
-    runRead(["cat", candidates[index]], function(exitCode, text) {
+    runRead([helperPath, "inspect", repositoryRoot], function(exitCode, text) {
       if (generation !== root.loadGeneration) return
-      if (exitCode !== 0) {
-        tryManifest(repositoryRoot, candidates, index + 1, generation)
-        return
+      var result = parseHelperJSON(text)
+      if (exitCode !== 0 || result === null) result = {
+        ok: false, root: repositoryRoot, name: Model.basename(repositoryRoot),
+        manifestPath: null, projects: [], workspaces: [], warnings: [],
+        errors: [{ code: "helper-failed", scope: "manifest",
+          message: "The bounded manifest inspector failed." }],
       }
-      var result = Model.parseWorkspaceManifest(text, Model.basename(repositoryRoot))
       for (var i = 0; i < result.projects.length; i += 1) {
         var project = result.projects[i]
-        project.repoRoot = repositoryRoot
-        project.key = repositoryRoot + "#" + project.id
-        project.cwd = Model.joinPath(repositoryRoot, project.path)
+        project.repoRoot = result.root
+        project.key = result.root + "#" + project.id
       }
       replaceRepository({
-        root: repositoryRoot,
+        root: result.root,
         name: result.name,
-        manifestPath: candidates[index],
+        manifestPath: result.manifestPath,
         ok: result.ok,
-        errors: result.errors,
-        warnings: result.warnings,
+        errors: result.errors || [],
+        warnings: result.warnings || [],
         projects: result.ok ? result.projects : [],
         workspaces: result.ok ? result.workspaces : [],
       })
+    })
+  }
+
+  function addRepository(path) {
+    setupMessage = "Checking repository…"
+    runRead([helperPath, "config-add", configPath, path], function(exitCode, text) {
+      var result = parseHelperJSON(text)
+      if (exitCode !== 0 || result === null || result.ok !== true) {
+        root.setupMessage = "Could not add that repository. Use an existing local directory."
+        return
+      }
+      root.setupMessage = "Repository added."
+      root.reload()
+    })
+  }
+
+  function removeRepository(path) {
+    runRead([helperPath, "config-remove", configPath, path], function(exitCode, text) {
+      var result = parseHelperJSON(text)
+      root.setupMessage = exitCode === 0 && result !== null && result.ok === true
+        ? "Repository removed." : "Could not remove that repository."
+      if (exitCode === 0) root.reload()
     })
   }
 
@@ -288,40 +301,59 @@ Panel {
 
   function startProject(repository, project) {
     var gate = Model.canStart(project, repoStatusMap(repository, runtimes))
-    if (!gate.ok) return
+    if (!gate.ok || pendingReview !== null) return
+    runRead([helperPath, "preflight", repository.root, project.id], function(exitCode, text) {
+      if (root.pendingReview !== null) return
+      var review = parseHelperJSON(text)
+      if (exitCode !== 0 || review === null || review.ok !== true) {
+        failStart(project, "Exact command/origin review failed. Check the manifest and local runtime.")
+        return
+      }
+      review.project = project
+      review.repository = repository
+      root.pendingReview = review
+    })
+  }
+
+  function confirmPendingReview() {
+    if (pendingReview === null) return
+    var review = pendingReview
+    pendingReview = null
+    var project = review.project
     setRuntime(project.key, {
       status: Model.STATUS.starting, name: project.name, url: project.url,
       message: "", tail: [], startedAt: Date.now(), probeInFlight: false,
     })
-    runRead(["which", project.command.executable], function(whichExit) {
+    runRead(Model.curlProbeArgv(project.healthCheckURL), function(_probeExit, body) {
       if (statusFor(project.key) !== Model.STATUS.starting) return
-      if (whichExit !== 0) {
-        failStart(project, "Executable \"" + project.command.executable
-          + "\" was not found on PATH.")
+      if (Model.isReadyHttpCode(body)) {
+        var conflictMessage = "Something is already responding at "
+          + project.healthCheckURL + ". Not starting a second copy."
+        setRuntime(project.key, {
+          status: Model.STATUS.conflict,
+          message: conflictMessage,
+        })
+        notifyTransition(project.name, Model.STATUS.conflict, conflictMessage)
         return
       }
-      runRead(Model.dirCheckArgv(project.cwd), function(dirExit) {
-        if (statusFor(project.key) !== Model.STATUS.starting) return
-        if (dirExit !== 0) {
-          failStart(project, "Project directory not found: " + project.cwd)
-          return
-        }
-        runRead(Model.curlProbeArgv(project.healthCheckURL), function(_probeExit, body) {
-          if (statusFor(project.key) !== Model.STATUS.starting) return
-          if (Model.isReadyHttpCode(body)) {
-            var conflictMessage = "Something is already responding at "
-              + project.healthCheckURL + ". Not starting a second copy."
-            setRuntime(project.key, {
-              status: Model.STATUS.conflict,
-              message: conflictMessage,
-            })
-            notifyTransition(project.name, Model.STATUS.conflict, conflictMessage)
-            return
-          }
-          spawnRunner(project)
-        })
-      })
+      spawnRunner(project, review.fingerprint)
     })
+  }
+
+  function cancelPendingReview() {
+    var cancelled = pendingReview
+    pendingReview = null
+    if (cancelled === null) return
+    var keys = Object.keys(orchestrations)
+    for (var i = 0; i < keys.length; i += 1) {
+      var record = orchestrations[keys[i]]
+      if (record.state === "running"
+          && record.repoRoot === cancelled.repository.root
+          && record.plan.indexOf(cancelled.project.id) !== -1) {
+        setOrchestration(keys[i], orchestrationWith(record, "halted",
+          "Halted: execution review was cancelled for " + cancelled.project.name + "."))
+      }
+    }
   }
 
   function failStart(project, message) {
@@ -329,13 +361,11 @@ Panel {
     notifyTransition(project.name, Model.STATUS.failed, message)
   }
 
-  function spawnRunner(project) {
+  function spawnRunner(project, fingerprint) {
     if (statusFor(project.key) !== Model.STATUS.starting) return
     var runner = runnerComponent.createObject(root, {
       projectKey: project.key,
-      command: project.command.argv,
-      workingDirectory: project.cwd,
-      environment: { PORT: String(project.port) },
+      command: [helperPath, "run", project.repoRoot, project.id, fingerprint],
     })
     if (runner === null) {
       failStart(project, "Could not create the process object.")
@@ -355,6 +385,13 @@ Panel {
     setRuntime(key, { status: Model.STATUS.stopping, message: "" })
     runner.running = false
   }
+
+  function stopAllProcesses() {
+    var keys = Object.keys(activeProcesses)
+    for (var i = 0; i < keys.length; i += 1) stopProject(keys[i])
+  }
+
+  Component.onDestruction: stopAllProcesses()
 
   function handleRunnerExit(key, exitCode, tail) {
     delete activeProcesses[key]
@@ -621,7 +658,7 @@ Panel {
   }
 
   // -------------------------------------------------------------------------
-  // One-shot readers (cat / which / curl) and project runners
+  // Bounded one-shot helper/probe readers and supervised project runners
   // -------------------------------------------------------------------------
 
   Component {
@@ -696,6 +733,12 @@ Panel {
   readonly property color faintForeground: Qt.alpha(root.barForeground, 0.4)
   readonly property int smallFontSize: Math.max(9, Math.round(Style.font.subtitle * 0.8))
 
+  // Repository manifests and process output are hostile display input. Every
+  // text surface uses this component so QML never interprets rich-text tags.
+  component SafeText: Text {
+    textFormat: Text.PlainText
+  }
+
   component ActionButton: Rectangle {
     id: actionButton
     property string label: ""
@@ -711,7 +754,7 @@ Panel {
     border.width: 1
     border.color: Qt.alpha(actionButton.accent, actionButton.actionEnabled ? 0.5 : 0.2)
     opacity: actionButton.actionEnabled ? 1.0 : 0.45
-    Text {
+    SafeText {
       id: actionLabel
       anchors.centerIn: parent
       text: actionButton.label
@@ -760,7 +803,7 @@ Panel {
           Row {
             width: parent.width
             spacing: Style.space(8)
-            Text {
+            SafeText {
               width: parent.width - rescanButton.width - Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
               text: "LocalWrap"
@@ -778,12 +821,136 @@ Panel {
             }
           }
 
+          // Standard-install onboarding: repository configuration is managed
+          // atomically by the helper, so no hand-edited JSON is required.
+          Column {
+            width: parent.width
+            spacing: Style.space(4)
+            SafeText {
+              width: parent.width
+              text: "Add a local repository"
+              color: root.mutedForeground
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: root.smallFontSize
+            }
+            Row {
+              width: parent.width
+              spacing: Style.space(6)
+              Rectangle {
+                width: parent.width - addRepositoryButton.width - Style.space(6)
+                height: addRepositoryButton.height
+                radius: Style.space(4)
+                color: Qt.alpha(root.barForeground, 0.06)
+                border.width: 1
+                border.color: Qt.alpha(root.barForeground, 0.2)
+                TextInput {
+                  id: repositoryPathInput
+                  anchors.fill: parent
+                  anchors.margins: Style.space(6)
+                  color: root.barForeground
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: root.smallFontSize
+                  clip: true
+                  selectByMouse: true
+                }
+                SafeText {
+                  anchors.fill: parent
+                  anchors.margins: Style.space(6)
+                  visible: repositoryPathInput.text === ""
+                  text: "/home/you/src/project"
+                  color: root.faintForeground
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: root.smallFontSize
+                }
+              }
+              ActionButton {
+                id: addRepositoryButton
+                label: "Add"
+                actionEnabled: repositoryPathInput.text.trim() !== ""
+                onActivated: {
+                  root.addRepository(repositoryPathInput.text)
+                  repositoryPathInput.text = ""
+                }
+              }
+            }
+            SafeText {
+              width: parent.width
+              visible: root.setupMessage !== ""
+              text: root.setupMessage
+              color: root.faintForeground
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: root.smallFontSize
+              wrapMode: Text.WordWrap
+            }
+          }
+
+          // A manifest can propose execution, but cannot authorize it. This
+          // card exposes the exact argv, resolved executable, working directory,
+          // and command origin before a one-time fingerprint confirmation.
+          Rectangle {
+            width: parent.width
+            visible: root.pendingReview !== null
+            implicitHeight: reviewColumn.implicitHeight + Style.space(16)
+            radius: Style.space(6)
+            color: Qt.alpha(Model.statusColor(Model.STATUS.stalled), 0.08)
+            border.width: 1
+            border.color: Qt.alpha(Model.statusColor(Model.STATUS.stalled), 0.5)
+            Column {
+              id: reviewColumn
+              anchors.fill: parent
+              anchors.margins: Style.space(8)
+              spacing: Style.space(4)
+              SafeText {
+                width: parent.width
+                text: root.pendingReview !== null
+                  ? "Review execution — " + root.pendingReview.projectName : ""
+                color: root.barForeground
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: root.smallFontSize
+                font.bold: true
+                wrapMode: Text.WordWrap
+              }
+              SafeText {
+                width: parent.width
+                text: root.pendingReview !== null
+                  ? "Command: " + root.pendingReview.displayCommand
+                    + "\nResolved executable: " + root.pendingReview.executable
+                    + "\nWorking directory: " + root.pendingReview.cwd
+                    + "\nOrigin: " + root.pendingReview.reviewDetail : ""
+                color: root.mutedForeground
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: root.smallFontSize
+                wrapMode: Text.WrapAnywhere
+              }
+              SafeText {
+                width: parent.width
+                text: "Confirm only if you trust this repository and exact command. Any origin change invalidates this review."
+                color: Model.statusColor(Model.STATUS.stalled)
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: root.smallFontSize
+                wrapMode: Text.WordWrap
+              }
+              Row {
+                spacing: Style.space(6)
+                ActionButton {
+                  label: "Cancel"
+                  onActivated: root.cancelPendingReview()
+                }
+                ActionButton {
+                  label: "Confirm & Start"
+                  accent: Model.statusColor(Model.STATUS.ready)
+                  onActivated: root.confirmPendingReview()
+                }
+              }
+            }
+          }
+
           // Configuration guidance and errors
           Column {
             width: parent.width
             spacing: Style.space(4)
             visible: root.configLoaded && root.configError !== ""
-            Text {
+            SafeText {
               width: parent.width
               text: root.configError === "missing-config"
                 ? "No repositories configured yet."
@@ -793,12 +960,10 @@ Panel {
               font.pixelSize: root.smallFontSize
               wrapMode: Text.WordWrap
             }
-            Text {
+            SafeText {
               width: parent.width
               visible: root.configError === "missing-config"
-              text: "List the repositories that contain a LocalWrap manifest in\n"
-                + root.configPath + "\n\n"
-                + "{ \"repositories\": [\"~/src/my-app\"] }"
+              text: "Enter an existing repository path above and press Add."
               color: root.faintForeground
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
               font.pixelSize: root.smallFontSize
@@ -819,7 +984,7 @@ Panel {
               Column {
                 width: parent.width
                 spacing: 0
-                Text {
+                SafeText {
                   width: parent.width
                   text: repositoryDelegate.repository.name
                   color: root.barForeground
@@ -827,7 +992,7 @@ Panel {
                   font.pixelSize: Style.font.subtitle
                   elide: Text.ElideRight
                 }
-                Text {
+                SafeText {
                   width: parent.width
                   text: repositoryDelegate.repository.root
                   color: root.faintForeground
@@ -837,7 +1002,7 @@ Panel {
                 }
               }
 
-              Text {
+              SafeText {
                 width: parent.width
                 visible: repositoryDelegate.repository.loading === true
                 text: "Reading manifest…"
@@ -848,7 +1013,7 @@ Panel {
 
               // Manifest blockers keep the repository visible but inert,
               // mirroring the app's review: blockers disable import.
-              Text {
+              SafeText {
                 width: parent.width
                 visible: !repositoryDelegate.repository.ok
                 text: root.diagnosticsText(repositoryDelegate.repository.errors)
@@ -857,7 +1022,7 @@ Panel {
                 font.pixelSize: root.smallFontSize
                 wrapMode: Text.WordWrap
               }
-              Text {
+              SafeText {
                 width: parent.width
                 visible: repositoryDelegate.repository.warnings.length > 0
                 text: root.diagnosticsText(repositoryDelegate.repository.warnings)
@@ -895,7 +1060,7 @@ Panel {
                     Column {
                       width: parent.width - Style.space(8) - actionRow.width - Style.space(12)
                       anchors.verticalCenter: parent.verticalCenter
-                      Text {
+                      SafeText {
                         width: parent.width
                         text: projectDelegate.project.name + "  ·  "
                           + Model.statusLabel(projectDelegate.projectStatus)
@@ -904,7 +1069,7 @@ Panel {
                         font.pixelSize: root.smallFontSize
                         elide: Text.ElideRight
                       }
-                      Text {
+                      SafeText {
                         width: parent.width
                         text: projectDelegate.project.commandLine + "  →  "
                           + projectDelegate.project.url
@@ -943,7 +1108,7 @@ Panel {
                     }
                   }
 
-                  Text {
+                  SafeText {
                     width: parent.width
                     visible: !projectDelegate.gate.ok
                       && !Model.isRunningStatus(projectDelegate.projectStatus)
@@ -958,7 +1123,7 @@ Panel {
                   Column {
                     width: parent.width
                     visible: projectDelegate.runtime.message !== ""
-                    Text {
+                    SafeText {
                       width: parent.width
                       text: projectDelegate.runtime.message
                       color: Model.statusColor(projectDelegate.projectStatus)
@@ -968,7 +1133,7 @@ Panel {
                     }
                     Repeater {
                       model: projectDelegate.runtime.tail.slice(-6)
-                      delegate: Text {
+                      delegate: SafeText {
                         required property string modelData
                         width: contentColumn.width
                         text: modelData
@@ -982,7 +1147,7 @@ Panel {
                 }
               }
 
-              Text {
+              SafeText {
                 width: parent.width
                 visible: (repositoryDelegate.repository.workspaces || []).length > 0
                 text: "Workspaces"
@@ -1023,7 +1188,7 @@ Panel {
                     Column {
                       width: parent.width - Style.space(8) - workspaceActions.width - Style.space(12)
                       anchors.verticalCenter: parent.verticalCenter
-                      Text {
+                      SafeText {
                         width: parent.width
                         text: workspaceDelegate.workspace.name + "  ·  "
                           + workspaceDelegate.planSummary.ready + "/"
@@ -1033,7 +1198,7 @@ Panel {
                         font.pixelSize: root.smallFontSize
                         elide: Text.ElideRight
                       }
-                      Text {
+                      SafeText {
                         width: parent.width
                         text: workspaceDelegate.plan.join(" → ")
                         color: root.faintForeground
@@ -1067,7 +1232,7 @@ Panel {
                     }
                   }
 
-                  Text {
+                  SafeText {
                     width: parent.width
                     visible: workspaceDelegate.record !== undefined
                       && workspaceDelegate.record.message !== ""
@@ -1082,6 +1247,13 @@ Panel {
                     wrapMode: Text.WordWrap
                   }
                 }
+              }
+
+              ActionButton {
+                visible: repositoryDelegate.repository.loading !== true
+                label: "Remove repository"
+                accent: root.mutedForeground
+                onActivated: root.removeRepository(repositoryDelegate.repository.root)
               }
             }
           }
@@ -1098,7 +1270,7 @@ Panel {
                 required property var modelData
                 width: parent.width
                 spacing: Style.space(6)
-                Text {
+                SafeText {
                   width: parent.width - orphanStop.width - Style.space(6)
                   anchors.verticalCenter: parent.verticalCenter
                   text: orphanDelegate.modelData.name + " — no longer in a manifest"
@@ -1117,7 +1289,7 @@ Panel {
             }
           }
 
-          Text {
+          SafeText {
             width: parent.width
             visible: root.configError === ""
             text: root.configPath

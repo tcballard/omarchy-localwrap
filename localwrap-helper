@@ -1,0 +1,679 @@
+#!/usr/bin/env python3
+"""Bounded trust boundary and process supervisor for LocalWrap.
+
+The QML shell never parses repository-owned files directly and never launches
+manifest commands directly. This helper bounds input before JSON decoding,
+resolves containment on disk, builds a review fingerprint for the exact launch,
+and owns a dedicated process group for every confirmed dev server.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import selectors
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
+
+MAX_CONFIG_BYTES = 16 * 1024
+MAX_MANIFEST_BYTES = 64 * 1024
+MAX_PACKAGE_BYTES = 256 * 1024
+MAX_SCRIPT_BYTES = 1024 * 1024
+MAX_JSON_DEPTH = 12
+MAX_REPOSITORIES = 16
+MAX_PROJECTS = 32
+MAX_WORKSPACES = 16
+MAX_DEPENDENCIES = 16
+MAX_WORKSPACE_MEMBERS = 32
+MAX_NAME = 128
+MAX_ID = 128
+MAX_PATH = 256
+MAX_COMMAND = 512
+MAX_URL = 512
+MAX_ARGUMENTS = 32
+MAX_ARGUMENT = 256
+MAX_FORWARDED_OUTPUT = 64 * 1024
+MAX_RESPONSE_BYTES = 128 * 1024
+MAX_OUTPUT_LINE = 2048
+STOP_GRACE_SECONDS = 2.0
+MANIFESTS = (".localwrap/workspace.json", "localwrap.json")
+ROOT_FIELDS = {"localwrap", "name", "projects", "workspaces"}
+PROJECT_FIELDS = {
+    "id", "name", "path", "command", "port", "url", "autostart",
+    "openOnReady", "dependsOn", "healthCheck",
+}
+WORKSPACE_FIELDS = {"id", "name", "projects"}
+HEALTH_FIELDS = {"path", "url"}
+CONFIG_FIELDS = {"repositories", "notifications", "openOnReady"}
+LOOPBACK_HOSTS = {"127.0.0.1", "::1"}
+ALLOWED_EXECUTABLES = {"npm", "pnpm", "yarn", "bun", "node", "python", "python3"}
+FORBIDDEN_COMMAND_CHARS = set(";&|$`><(){}[]!#*?~%^\"'\r\n")
+
+
+class LocalWrapError(Exception):
+    pass
+
+
+def emit(value: Any) -> None:
+    data = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if len(data.encode("utf-8")) > MAX_RESPONSE_BYTES:
+        raise LocalWrapError("bounded helper response exceeded its output limit")
+    sys.stdout.write(data + "\n")
+
+
+def diagnostic(code: str, scope: str, message: str) -> dict[str, str]:
+    return {"code": code, "scope": scope, "message": message}
+
+
+def read_bounded(path: Path, limit: int, label: str) -> bytes:
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(limit + 1)
+    except OSError as exc:
+        raise LocalWrapError(f"cannot read {label}: {exc.strerror or exc}") from exc
+    if len(data) > limit:
+        raise LocalWrapError(f"{label} exceeds the {limit}-byte limit")
+    if b"\x00" in data:
+        raise LocalWrapError(f"{label} contains a NUL byte")
+    return data
+
+
+def file_digest(path: Path, limit: int, label: str) -> str:
+    return hashlib.sha256(read_bounded(path, limit, label)).hexdigest()
+
+
+def json_depth(raw: bytes) -> int:
+    depth = maximum = 0
+    in_string = escape = False
+    for byte in raw:
+        char = chr(byte)
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            maximum = max(maximum, depth)
+            if maximum > MAX_JSON_DEPTH:
+                return maximum
+        elif char in "]}":
+            depth -= 1
+            if depth < 0:
+                return MAX_JSON_DEPTH + 1
+    return maximum
+
+
+def load_json(path: Path, limit: int, label: str) -> Any:
+    raw = read_bounded(path, limit, label)
+    if json_depth(raw) > MAX_JSON_DEPTH:
+        raise LocalWrapError(f"{label} exceeds the JSON depth limit of {MAX_JSON_DEPTH}")
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LocalWrapError(f"{label} is not valid UTF-8 JSON: {exc}") from exc
+
+
+def ensure_string(value: Any, scope: str, maximum: int, *, nonempty: bool = True) -> str:
+    if not isinstance(value, str):
+        raise LocalWrapError(f"{scope} must be a string")
+    if len(value) > maximum:
+        raise LocalWrapError(f"{scope} exceeds the {maximum}-character limit")
+    result = value.strip()
+    if nonempty and not result:
+        raise LocalWrapError(f"{scope} must not be empty")
+    if any(ord(char) < 32 and char not in "\t" for char in result):
+        raise LocalWrapError(f"{scope} contains control characters")
+    return result
+
+
+def ensure_object(value: Any, scope: str, fields: set[str]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise LocalWrapError(f"{scope} must be an object")
+    unknown = sorted(set(value) - fields)
+    if unknown:
+        raise LocalWrapError(f'{scope} contains unknown field "{unknown[0]}"')
+    return value
+
+
+def is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def real_directory(path: Path, scope: str) -> Path:
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise LocalWrapError(f"{scope} cannot be resolved: {exc.strerror or exc}") from exc
+    if not resolved.is_dir():
+        raise LocalWrapError(f"{scope} is not a directory")
+    return resolved
+
+
+def resolve_repository(value: str) -> Path:
+    path_text = ensure_string(value, "repository path", 4096)
+    path = Path(os.path.expanduser(path_text))
+    if not path.is_absolute():
+        raise LocalWrapError("repository path must be absolute or start with ~/")
+    return real_directory(path, "repository")
+
+
+def configured_path(value: str, scope: str = "repository path") -> str:
+    path_text = ensure_string(value, scope, 4096)
+    path = Path(os.path.expanduser(path_text))
+    if not path.is_absolute():
+        raise LocalWrapError(f"{scope} must be absolute or start with ~/")
+    return os.path.normpath(str(path))
+
+
+def contained_path(root: Path, relative: str, scope: str, *, file_required: bool = False) -> Path:
+    value = ensure_string(relative, scope, MAX_PATH)
+    path = Path(value)
+    if path.is_absolute():
+        raise LocalWrapError(f"{scope} must be relative to the repository")
+    try:
+        resolved = (root / path).resolve(strict=True)
+    except OSError as exc:
+        raise LocalWrapError(f"{scope} cannot be resolved: {exc.strerror or exc}") from exc
+    if not is_within(resolved, root):
+        raise LocalWrapError(f"{scope} resolves outside the repository")
+    if file_required and not resolved.is_file():
+        raise LocalWrapError(f"{scope} must resolve to a regular file")
+    if not file_required and not resolved.is_dir():
+        raise LocalWrapError(f"{scope} must resolve to a directory")
+    return resolved
+
+
+def slug(value: str) -> str:
+    output = []
+    dash = False
+    for char in value.lower():
+        if "a" <= char <= "z" or "0" <= char <= "9":
+            output.append(char)
+            dash = False
+        elif output and not dash:
+            output.append("-")
+            dash = True
+    result = "".join(output).strip("-")
+    return result or "item"
+
+
+def unique_slug(value: str, used: set[str]) -> str:
+    base = slug(value)
+    candidate = base
+    suffix = 2
+    while candidate in used:
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
+
+
+def numeric_loopback_url(value: Any, scope: str, default_port: int | None = None) -> str:
+    if value is None:
+        if default_port is None:
+            raise LocalWrapError(f"{scope} is required")
+        return f"http://127.0.0.1:{default_port}"
+    text = ensure_string(value, scope, MAX_URL)
+    try:
+        parsed = urlsplit(text)
+        port = parsed.port
+    except ValueError as exc:
+        raise LocalWrapError(f"{scope} is invalid: {exc}") from exc
+    if parsed.scheme not in {"http", "https"}:
+        raise LocalWrapError(f"{scope} scheme must be http or https")
+    if parsed.username is not None or parsed.password is not None:
+        raise LocalWrapError(f"{scope} must not contain user information")
+    if parsed.hostname not in LOOPBACK_HOSTS:
+        raise LocalWrapError(f"{scope} host must be numeric loopback 127.0.0.1 or [::1]")
+    if port is None or not 1000 <= port <= 65535:
+        raise LocalWrapError(f"{scope} requires an explicit port from 1000 to 65535")
+    host = "[::1]" if parsed.hostname == "::1" else "127.0.0.1"
+    return urlunsplit((parsed.scheme, f"{host}:{port}", parsed.path, parsed.query, parsed.fragment))
+
+
+def manifest_file(root: Path) -> Path:
+    for relative in MANIFESTS:
+        candidate = root / relative
+        if candidate.is_symlink():
+            raise LocalWrapError(f"manifest {relative} must not be a symlink")
+        if candidate.is_file():
+            resolved = candidate.resolve(strict=True)
+            if not is_within(resolved, root):
+                raise LocalWrapError(f"manifest {relative} resolves outside the repository")
+            return resolved
+    raise LocalWrapError("no .localwrap/workspace.json or localwrap.json found")
+
+
+def parse_command(command: Any) -> list[str]:
+    text = ensure_string(command, "project command", MAX_COMMAND)
+    if any(char in FORBIDDEN_COMMAND_CHARS for char in text):
+        raise LocalWrapError("project command contains shell syntax or quoting")
+    argv = text.split()
+    if not argv or argv[0] not in ALLOWED_EXECUTABLES:
+        raise LocalWrapError("project command executable is not allowed")
+    if len(argv) > MAX_ARGUMENTS + 1 or any(len(arg) > MAX_ARGUMENT for arg in argv):
+        raise LocalWrapError("project command exceeds argument limits")
+    exe = argv[0]
+    if exe in {"npm", "pnpm", "yarn", "bun"}:
+        valid = len(argv) == 3 and argv[1] == "run" and not argv[2].startswith("-")
+        valid = valid or (exe == "npm" and len(argv) == 2 and argv[1] == "start")
+        if not valid:
+            raise LocalWrapError(
+                "package managers permit only an exact local script: <manager> run <name> or npm start"
+            )
+    elif exe in {"node", "python", "python3"}:
+        if len(argv) < 2 or argv[1].startswith("-"):
+            raise LocalWrapError("interpreters require a repository-contained script path")
+    return argv
+
+
+def parse_manifest(root: Path) -> tuple[Path, dict[str, Any]]:
+    path = manifest_file(root)
+    document = load_json(path, MAX_MANIFEST_BYTES, "workspace manifest")
+    manifest = ensure_object(document, "manifest", ROOT_FIELDS)
+    if manifest.get("localwrap") != 1:
+        raise LocalWrapError('manifest requires "localwrap": 1')
+    name = ensure_string(manifest.get("name", root.name), "workspace name", MAX_NAME)
+    raw_projects = manifest.get("projects")
+    if not isinstance(raw_projects, list) or not raw_projects:
+        raise LocalWrapError("manifest requires at least one project")
+    if len(raw_projects) > MAX_PROJECTS:
+        raise LocalWrapError(f"manifest exceeds the {MAX_PROJECTS}-project limit")
+
+    used: set[str] = set()
+    projects: list[dict[str, Any]] = []
+    raw_dependencies: list[list[str]] = []
+    for index, item in enumerate(raw_projects):
+        scope = f"projects[{index}]"
+        raw = ensure_object(item, scope, PROJECT_FIELDS)
+        explicit_id = ensure_string(raw["id"], f"{scope}.id", MAX_ID) if "id" in raw else ""
+        project_name = ensure_string(raw.get("name", explicit_id or f"Project {index + 1}"), f"{scope}.name", MAX_NAME)
+        project_id = unique_slug(explicit_id or project_name or f"project-{index + 1}", used)
+        relative = ensure_string(raw.get("path", "."), f"{scope}.path", MAX_PATH)
+        cwd = contained_path(root, relative, f"{scope}.path")
+        argv = parse_command(raw.get("command"))
+        port = raw.get("port", 3000)
+        if isinstance(port, bool) or not isinstance(port, int) or not 1000 <= port <= 65535:
+            raise LocalWrapError(f"{scope}.port must be an integer from 1000 to 65535")
+        url = numeric_loopback_url(raw.get("url"), f"{scope}.url", port)
+        health = raw.get("healthCheck")
+        if health is None:
+            health_url = url
+        else:
+            health_obj = ensure_object(health, f"{scope}.healthCheck", HEALTH_FIELDS)
+            has_path = "path" in health_obj
+            has_url = "url" in health_obj
+            if has_path == has_url:
+                raise LocalWrapError(f"{scope}.healthCheck requires exactly one of path or url")
+            if has_url:
+                health_url = numeric_loopback_url(health_obj["url"], f"{scope}.healthCheck.url")
+            else:
+                health_path = ensure_string(health_obj["path"], f"{scope}.healthCheck.path", MAX_PATH)
+                if not health_path.startswith("/") or health_path.startswith("//"):
+                    raise LocalWrapError(f"{scope}.healthCheck.path must start with one /")
+                parsed = urlsplit(url)
+                health_url = urlunsplit((parsed.scheme, parsed.netloc, health_path, "", ""))
+        dependencies = raw.get("dependsOn", [])
+        if not isinstance(dependencies, list) or len(dependencies) > MAX_DEPENDENCIES:
+            raise LocalWrapError(f"{scope}.dependsOn exceeds the {MAX_DEPENDENCIES}-dependency limit")
+        deps = [ensure_string(dep, f"{scope}.dependsOn", MAX_ID) for dep in dependencies]
+        for boolean_field, default in (("autostart", False), ("openOnReady", True)):
+            if boolean_field in raw and not isinstance(raw[boolean_field], bool):
+                raise LocalWrapError(f"{scope}.{boolean_field} must be boolean")
+        projects.append({
+            "id": project_id, "name": project_name, "path": relative,
+            "commandLine": " ".join(argv), "port": port, "url": url,
+            "healthCheckURL": health_url, "autostart": bool(raw.get("autostart", False)),
+            "openOnReady": bool(raw.get("openOnReady", True)), "dependsOn": [],
+            "cwd": str(cwd),
+        })
+        raw_dependencies.append(deps)
+
+    by_id = {project["id"]: project for project in projects}
+    for index, deps in enumerate(raw_dependencies):
+        for dep in deps:
+            dep_id = slug(dep)
+            if dep_id not in by_id:
+                raise LocalWrapError(f'projects[{index}].dependsOn references unknown project "{dep}"')
+            if dep_id == projects[index]["id"]:
+                raise LocalWrapError(f"projects[{index}] cannot depend on itself")
+            if dep_id in projects[index]["dependsOn"]:
+                raise LocalWrapError(f"projects[{index}].dependsOn contains a duplicate")
+            projects[index]["dependsOn"].append(dep_id)
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    def visit(project_id: str) -> None:
+        if project_id in visiting:
+            raise LocalWrapError(f'dependency cycle involves "{project_id}"')
+        if project_id in visited:
+            return
+        visiting.add(project_id)
+        for dep in by_id[project_id]["dependsOn"]:
+            visit(dep)
+        visiting.remove(project_id)
+        visited.add(project_id)
+    for project in projects:
+        visit(project["id"])
+
+    raw_workspaces = manifest.get("workspaces", [])
+    if not isinstance(raw_workspaces, list) or len(raw_workspaces) > MAX_WORKSPACES:
+        raise LocalWrapError(f"workspaces must be an array of at most {MAX_WORKSPACES}")
+    workspace_used: set[str] = set()
+    workspaces: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_workspaces):
+        scope = f"workspaces[{index}]"
+        raw = ensure_object(item, scope, WORKSPACE_FIELDS)
+        explicit_id = ensure_string(raw["id"], f"{scope}.id", MAX_ID) if "id" in raw else ""
+        workspace_name = ensure_string(raw.get("name", explicit_id or f"Workspace {index + 1}"), f"{scope}.name", MAX_NAME)
+        members = raw.get("projects")
+        if not isinstance(members, list) or not members or len(members) > MAX_WORKSPACE_MEMBERS:
+            raise LocalWrapError(f"{scope}.projects requires 1-{MAX_WORKSPACE_MEMBERS} members")
+        member_ids: list[str] = []
+        for member in members:
+            member_id = slug(ensure_string(member, f"{scope}.projects", MAX_ID))
+            if member_id not in by_id:
+                raise LocalWrapError(f'{scope}.projects references unknown project "{member}"')
+            if member_id in member_ids:
+                raise LocalWrapError(f"{scope}.projects contains a duplicate")
+            member_ids.append(member_id)
+        workspaces.append({
+            "id": unique_slug(explicit_id or workspace_name, workspace_used),
+            "name": workspace_name, "projects": member_ids,
+        })
+    return path, {"name": name, "projects": projects, "workspaces": workspaces}
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"repositories": [], "notifications": False, "openOnReady": False}
+    document = load_json(path, MAX_CONFIG_BYTES, "repository configuration")
+    root = ensure_object(document, "configuration", CONFIG_FIELDS)
+    repositories = root.get("repositories", [])
+    if not isinstance(repositories, list) or len(repositories) > MAX_REPOSITORIES:
+        raise LocalWrapError(f"configuration permits at most {MAX_REPOSITORIES} repositories")
+    resolved: list[str] = []
+    for index, entry in enumerate(repositories):
+        repository = configured_path(entry, f"repositories[{index}]")
+        if repository in resolved:
+            raise LocalWrapError("configuration contains a duplicate repository")
+        resolved.append(repository)
+    for field in ("notifications", "openOnReady"):
+        if field in root and not isinstance(root[field], bool):
+            raise LocalWrapError(f"configuration field {field} must be boolean")
+    return {
+        "repositories": resolved,
+        "notifications": bool(root.get("notifications", False)),
+        "openOnReady": bool(root.get("openOnReady", False)),
+    }
+
+
+def atomic_write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    payload = (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    if len(payload) > MAX_CONFIG_BYTES:
+        raise LocalWrapError("repository configuration exceeds its byte limit")
+    descriptor, temporary = tempfile.mkstemp(prefix=".repositories.", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def package_script(cwd: Path, argv: list[str]) -> tuple[Path, str, list[dict[str, str]]]:
+    package_path = cwd / "package.json"
+    if package_path.is_symlink():
+        raise LocalWrapError("package.json must not be a symlink")
+    document = load_json(package_path, MAX_PACKAGE_BYTES, "package.json")
+    if not isinstance(document, dict) or not isinstance(document.get("scripts"), dict):
+        raise LocalWrapError("package.json has no scripts object")
+    script_name = "start" if argv[0] == "npm" and argv[1] == "start" else argv[2]
+    reviewed = []
+    for name in ("pre" + script_name, script_name, "post" + script_name):
+        if name in document["scripts"]:
+            reviewed.append({
+                "name": name,
+                "value": ensure_string(document["scripts"].get(name), f'package script "{name}"', MAX_COMMAND),
+            })
+    if not any(item["name"] == script_name for item in reviewed):
+        raise LocalWrapError(f'package script "{script_name}" is missing')
+    return package_path.resolve(strict=True), script_name, reviewed
+
+
+def launch_plan(root: Path, project_id: str) -> dict[str, Any]:
+    manifest_path, manifest = parse_manifest(root)
+    project = next((item for item in manifest["projects"] if item["id"] == project_id), None)
+    if project is None:
+        raise LocalWrapError(f'project "{project_id}" is not in the current manifest')
+    argv = parse_command(project["commandLine"])
+    executable = shutil.which(argv[0])
+    if executable is None:
+        raise LocalWrapError(f'executable "{argv[0]}" was not found on PATH')
+    executable_path = Path(executable).resolve(strict=True)
+    if not executable_path.is_file():
+        raise LocalWrapError("resolved executable is not a regular file")
+    cwd = real_directory(Path(project["cwd"]), "project directory")
+    if not is_within(cwd, root):
+        raise LocalWrapError("project directory resolves outside the repository")
+    origins = [{
+        "kind": "manifest", "path": str(manifest_path),
+        "sha256": file_digest(manifest_path, MAX_MANIFEST_BYTES, "workspace manifest"),
+    }]
+    review_detail = "Repository-contained script"
+    if argv[0] in {"npm", "pnpm", "yarn", "bun"}:
+        package_path, script_name, scripts = package_script(cwd, argv)
+        if not is_within(package_path, root):
+            raise LocalWrapError("package.json resolves outside the repository")
+        origins.append({
+            "kind": "package-script", "path": str(package_path), "name": script_name,
+            "scripts": scripts,
+            "sha256": file_digest(package_path, MAX_PACKAGE_BYTES, "package.json"),
+        })
+        review_detail = f"{package_path} (sha256 {origins[-1]['sha256']})"
+        for item in scripts:
+            review_detail += f"\n{item['name']}: {item['value']}"
+    else:
+        script_path = contained_path(cwd, argv[1], "interpreter script", file_required=True)
+        if not is_within(script_path, root):
+            raise LocalWrapError("interpreter script resolves outside the repository")
+        origins.append({
+            "kind": "script", "path": str(script_path),
+            "sha256": file_digest(script_path, MAX_SCRIPT_BYTES, "interpreter script"),
+        })
+        review_detail = f"Local script: {script_path}\nsha256: {origins[-1]['sha256']}"
+    core = {
+        "repository": str(root), "projectId": project["id"], "projectName": project["name"],
+        "cwd": str(cwd), "executable": str(executable_path),
+        "argv": [str(executable_path)] + argv[1:], "displayCommand": project["commandLine"],
+        "port": project["port"], "origins": origins, "reviewDetail": review_detail,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(core, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {**core, "fingerprint": fingerprint}
+
+
+ACTIVE_CHILD: subprocess.Popen[bytes] | None = None
+
+
+def terminate_group(child: subprocess.Popen[bytes]) -> None:
+    def group_exists() -> bool:
+        try:
+            os.killpg(child.pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + STOP_GRACE_SECONDS
+    while group_exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if group_exists():
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        child.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def signal_cleanup(_signum: int, _frame: Any) -> None:
+    if ACTIVE_CHILD is not None:
+        terminate_group(ACTIVE_CHILD)
+    raise SystemExit(143)
+
+
+def forward_bounded(child: subprocess.Popen[bytes]) -> int:
+    selector = selectors.DefaultSelector()
+    assert child.stdout is not None and child.stderr is not None
+    for stream in (child.stdout, child.stderr):
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ)
+    forwarded = 0
+    pending = {child.stdout: b"", child.stderr: b""}
+    while selector.get_map():
+        for key, _mask in selector.select(timeout=0.2):
+            stream = key.fileobj
+            try:
+                chunk = os.read(stream.fileno(), 4096)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                selector.unregister(stream)
+                continue
+            data = pending[stream] + chunk
+            parts = data.split(b"\n")
+            # Retain only a bounded prefix of a newline-free producer chunk.
+            # Without this cap, a server that never emits "\n" could grow the
+            # helper's own pending buffer even though forwarded output is capped.
+            pending[stream] = parts.pop()[:MAX_OUTPUT_LINE]
+            for line in parts:
+                if forwarded >= MAX_FORWARDED_OUTPUT:
+                    continue
+                safe = line[:MAX_OUTPUT_LINE].decode("utf-8", "replace")
+                encoded = (safe + "\n").encode("utf-8")
+                remaining = MAX_FORWARDED_OUTPUT - forwarded
+                encoded = encoded[:remaining]
+                sys.stdout.buffer.write(encoded)
+                sys.stdout.buffer.flush()
+                forwarded += len(encoded)
+        if child.poll() is not None and not selector.get_map():
+            break
+    for data in pending.values():
+        if data and forwarded < MAX_FORWARDED_OUTPUT:
+            safe = data[:MAX_OUTPUT_LINE].decode("utf-8", "replace")
+            encoded = (safe + "\n").encode("utf-8")[: MAX_FORWARDED_OUTPUT - forwarded]
+            sys.stdout.buffer.write(encoded)
+            sys.stdout.buffer.flush()
+    return child.wait()
+
+
+def command_inspect(repository: str) -> None:
+    root = resolve_repository(repository)
+    try:
+        path, manifest = parse_manifest(root)
+        emit({"ok": True, "root": str(root), "manifestPath": str(path), **manifest})
+    except LocalWrapError as exc:
+        emit({
+            "ok": False, "root": str(root), "name": root.name, "manifestPath": None,
+            "projects": [], "workspaces": [],
+            "errors": [diagnostic("manifest-rejected", "manifest", str(exc))], "warnings": [],
+        })
+
+
+def command_run(repository: str, project_id: str, fingerprint: str) -> None:
+    global ACTIVE_CHILD
+    root = resolve_repository(repository)
+    plan = launch_plan(root, project_id)
+    if not hmac.compare_digest(plan["fingerprint"], fingerprint):
+        raise LocalWrapError("launch details changed after review; review and confirm again")
+    environment = dict(os.environ)
+    environment["PORT"] = str(plan["port"])
+    ACTIVE_CHILD = subprocess.Popen(
+        plan["argv"], cwd=plan["cwd"], env=environment,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+    )
+    try:
+        code = forward_bounded(ACTIVE_CHILD)
+    finally:
+        terminate_group(ACTIVE_CHILD)
+        ACTIVE_CHILD = None
+    raise SystemExit(code)
+
+
+def main(argv: list[str]) -> None:
+    if len(argv) < 2:
+        raise LocalWrapError("missing helper command")
+    command = argv[1]
+    if command == "config-get" and len(argv) == 3:
+        emit({"ok": True, **load_config(Path(argv[2]))})
+    elif command == "config-add" and len(argv) == 4:
+        path = Path(argv[2])
+        config = load_config(path)
+        repository = str(resolve_repository(argv[3]))
+        if repository not in config["repositories"]:
+            if len(config["repositories"]) >= MAX_REPOSITORIES:
+                raise LocalWrapError(f"configuration permits at most {MAX_REPOSITORIES} repositories")
+            config["repositories"].append(repository)
+        atomic_write_json(path, config)
+        emit({"ok": True, **config})
+    elif command == "config-remove" and len(argv) == 4:
+        path = Path(argv[2])
+        config = load_config(path)
+        repository = configured_path(argv[3])
+        config["repositories"] = [item for item in config["repositories"] if item != repository]
+        atomic_write_json(path, config)
+        emit({"ok": True, **config})
+    elif command == "inspect" and len(argv) == 3:
+        command_inspect(argv[2])
+    elif command == "preflight" and len(argv) == 4:
+        emit({"ok": True, **launch_plan(resolve_repository(argv[2]), argv[3])})
+    elif command == "run" and len(argv) == 5:
+        command_run(argv[2], argv[3], argv[4])
+    else:
+        raise LocalWrapError("invalid helper command or argument count")
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, signal_cleanup)
+    signal.signal(signal.SIGINT, signal_cleanup)
+    try:
+        main(sys.argv)
+    except LocalWrapError as exc:
+        sys.stderr.write(f"LocalWrap: {exc}\n")
+        raise SystemExit(2)

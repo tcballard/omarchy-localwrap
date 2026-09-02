@@ -17,14 +17,24 @@
 // bottom. Keep every function pure: no I/O, no timers, no Qt or node APIs.
 
 var ALLOWED_EXECUTABLES = [
-    "npm", "npx", "yarn", "pnpm", "node", "bun", "python", "python3", "deno",
+    "npm", "yarn", "pnpm", "node", "bun", "python", "python3",
 ];
 
-var ALLOWED_URL_HOSTS = ["localhost", "127.0.0.1", "::1"];
+var ALLOWED_URL_HOSTS = ["127.0.0.1", "::1"];
 
 var MIN_PORT = 1000;
 var MAX_PORT = 65535;
 var DEFAULT_PORT = 3000;
+var MAX_MANIFEST_BYTES = 65536;
+var MAX_CONFIG_BYTES = 16384;
+var MAX_JSON_DEPTH = 12;
+var MAX_PROJECTS = 32;
+var MAX_WORKSPACES = 16;
+var MAX_DEPENDENCIES = 16;
+var MAX_NAME_LENGTH = 128;
+var MAX_PATH_LENGTH = 256;
+var MAX_COMMAND_LENGTH = 512;
+var MAX_OUTPUT_LINE_LENGTH = 2048;
 
 // Readiness contract mirrored from RuntimeService/ReadinessService:
 // poll every 500 ms for up to 30 s; each probe is a HEAD request with a
@@ -83,6 +93,50 @@ function basename(path) {
     return index === -1 ? trimmed : trimmed.slice(index + 1);
 }
 
+function utf8ByteLength(value) {
+    var text = String(value);
+    var bytes = 0;
+    for (var i = 0; i < text.length; i += 1) {
+        var code = text.charCodeAt(i);
+        if (code < 0x80) { bytes += 1; }
+        else if (code < 0x800) { bytes += 2; }
+        else if (code >= 0xD800 && code <= 0xDBFF
+                 && i + 1 < text.length
+                 && text.charCodeAt(i + 1) >= 0xDC00
+                 && text.charCodeAt(i + 1) <= 0xDFFF) {
+            bytes += 4;
+            i += 1;
+        } else { bytes += 3; }
+    }
+    return bytes;
+}
+
+// Pre-parse depth scan ignores braces inside JSON strings. It rejects deeply
+// nested input before JSON.parse can allocate the object graph.
+function jsonDepthWithinLimit(value, maximum) {
+    var text = String(value);
+    var depth = 0;
+    var inString = false;
+    var escaped = false;
+    for (var i = 0; i < text.length; i += 1) {
+        var character = text.charAt(i);
+        if (inString) {
+            if (escaped) { escaped = false; }
+            else if (character === "\\") { escaped = true; }
+            else if (character === "\"") { inString = false; }
+        } else if (character === "\"") {
+            inString = true;
+        } else if (character === "{" || character === "[") {
+            depth += 1;
+            if (depth > maximum) { return false; }
+        } else if (character === "}" || character === "]") {
+            depth -= 1;
+            if (depth < 0) { return false; }
+        }
+    }
+    return depth === 0 && !inString;
+}
+
 // ---------------------------------------------------------------------------
 // Command parsing (CommandParser)
 // ---------------------------------------------------------------------------
@@ -93,6 +147,9 @@ function parseCommand(input) {
     var command = isString(input) ? input.trim() : "";
     if (command === "") {
         return { ok: false, error: "Command is empty." };
+    }
+    if (command.length > MAX_COMMAND_LENGTH) {
+        return { ok: false, error: "Command exceeds the 512-character limit." };
     }
     if (FORBIDDEN_COMMAND_CHARACTERS.test(command)) {
         return {
@@ -108,6 +165,17 @@ function parseCommand(input) {
             error: "Executable \"" + executable + "\" is not allowed. Allowed: "
                 + ALLOWED_EXECUTABLES.join(" ") + ".",
         };
+    }
+    if (contains(["npm", "pnpm", "yarn", "bun"], executable)) {
+        var exactPackageScript = tokens.length === 3 && tokens[1] === "run"
+            && tokens[2].charAt(0) !== "-";
+        var npmStart = executable === "npm" && tokens.length === 2
+            && tokens[1] === "start";
+        if (!exactPackageScript && !npmStart) {
+            return { ok: false, error: "Package managers permit only an exact local script." };
+        }
+    } else if (tokens.length < 2 || tokens[1].charAt(0) === "-") {
+        return { ok: false, error: "Interpreters require a repository-contained script path." };
     }
     return {
         ok: true,
@@ -125,7 +193,7 @@ function formatCommand(parsed) {
 // Loopback URL validation (LocalURLValidator)
 // ---------------------------------------------------------------------------
 
-// Accepts only http(s) URLs whose host is localhost, 127.0.0.1, or [::1],
+// Accepts only http(s) URLs whose host is numeric loopback 127.0.0.1 or [::1],
 // with no userinfo and an explicit port between 1000 and 65535.
 function validateLoopbackURL(value) {
     if (!isNonEmptyString(value)) {
@@ -133,7 +201,7 @@ function validateLoopbackURL(value) {
     }
     var match = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/([^/?#]*)([/?#][\s\S]*)?$/.exec(value.trim());
     if (!match) {
-        return { ok: false, error: "URL must look like http://localhost:<port>." };
+        return { ok: false, error: "URL must look like http://127.0.0.1:<port>." };
     }
     var scheme = match[1].toLowerCase();
     if (scheme !== "http" && scheme !== "https") {
@@ -159,14 +227,14 @@ function validateLoopbackURL(value) {
         }
         if (host.indexOf(":") !== -1) {
             // IPv6 literals must use the bracketed [::1] form.
-            return { ok: false, error: "URL host must be localhost, 127.0.0.1, or [::1]." };
+            return { ok: false, error: "URL host must be numeric loopback 127.0.0.1 or [::1]." };
         }
     }
     host = host.toLowerCase();
     if (!contains(ALLOWED_URL_HOSTS, host)) {
         return {
             ok: false,
-            error: "URL host must be localhost, 127.0.0.1, or [::1].",
+            error: "URL host must be numeric loopback 127.0.0.1 or [::1].",
         };
     }
     if (portText === null || portText === "" || !/^\d+$/.test(portText)) {
@@ -284,6 +352,9 @@ function validateRelativePath(value) {
         return { ok: false, error: "Path must be a non-empty string." };
     }
     var path = value.trim();
+    if (path.length > MAX_PATH_LENGTH) {
+        return { ok: false, error: "Path exceeds the 256-character limit." };
+    }
     if (path.charAt(0) === "/") {
         return { ok: false, error: "Path must be relative to the repository root." };
     }
@@ -347,6 +418,16 @@ function parseWorkspaceManifest(text, fallbackName) {
         workspaces: [],
     };
 
+    if (!isString(text) || utf8ByteLength(text) > MAX_MANIFEST_BYTES) {
+        errors.push(makeDiagnostic("manifest-too-large", "manifest",
+            "Manifest exceeds the 65536-byte limit."));
+        return result;
+    }
+    if (!jsonDepthWithinLimit(text, MAX_JSON_DEPTH)) {
+        errors.push(makeDiagnostic("manifest-too-deep", "manifest",
+            "Manifest exceeds the JSON depth limit of 12."));
+        return result;
+    }
     var root;
     try {
         root = JSON.parse(text);
@@ -374,7 +455,7 @@ function parseWorkspaceManifest(text, fallbackName) {
             "Version 1 requires \"localwrap\": 1."));
     }
     if (root.name !== undefined) {
-        if (!isNonEmptyString(root.name)) {
+        if (!isNonEmptyString(root.name) || root.name.length > MAX_NAME_LENGTH) {
             errors.push(makeDiagnostic("name-invalid", "name",
                 "Workspace name must be a non-empty string."));
         } else {
@@ -384,6 +465,11 @@ function parseWorkspaceManifest(text, fallbackName) {
     if (!Array.isArray(root.projects) || root.projects.length === 0) {
         errors.push(makeDiagnostic("projects-required", "projects",
             "Manifest requires at least one project."));
+        return result;
+    }
+    if (root.projects.length > MAX_PROJECTS) {
+        errors.push(makeDiagnostic("projects-limit", "projects",
+            "Manifest permits at most 32 projects."));
         return result;
     }
 
@@ -431,7 +517,7 @@ function parseWorkspaceManifest(text, fallbackName) {
             }
         }
         if (raw.name !== undefined) {
-            if (!isNonEmptyString(raw.name)) {
+            if (!isNonEmptyString(raw.name) || raw.name.length > MAX_NAME_LENGTH) {
                 errors.push(makeDiagnostic("name-invalid", scope + ".name",
                     "Project name must be a non-empty string."));
             } else {
@@ -494,7 +580,7 @@ function parseWorkspaceManifest(text, fallbackName) {
             }
         }
         if (project.url === null) {
-            project.url = "http://localhost:" + project.port;
+            project.url = "http://127.0.0.1:" + project.port;
         }
 
         if (raw.autostart !== undefined) {
@@ -518,6 +604,9 @@ function parseWorkspaceManifest(text, fallbackName) {
             if (!Array.isArray(raw.dependsOn)) {
                 errors.push(makeDiagnostic("depends-on-invalid", scope + ".dependsOn",
                     "dependsOn must be an array of project IDs."));
+            } else if (raw.dependsOn.length > MAX_DEPENDENCIES) {
+                errors.push(makeDiagnostic("depends-on-limit", scope + ".dependsOn",
+                    "dependsOn permits at most 16 project IDs."));
             } else {
                 var seenRefs = {};
                 for (var d = 0; d < raw.dependsOn.length; d += 1) {
@@ -625,6 +714,9 @@ function parseWorkspaceManifest(text, fallbackName) {
         if (!Array.isArray(root.workspaces)) {
             errors.push(makeDiagnostic("workspaces-invalid", "workspaces",
                 "workspaces must be an array."));
+        } else if (root.workspaces.length > MAX_WORKSPACES) {
+            errors.push(makeDiagnostic("workspaces-limit", "workspaces",
+                "Manifest permits at most 16 workspaces."));
         } else {
             var usedWorkspaceIDs = {};
             for (var w = 0; w < root.workspaces.length; w += 1) {
@@ -654,7 +746,8 @@ function parseWorkspaceManifest(text, fallbackName) {
                     }
                 }
                 if (rawWorkspace.name !== undefined) {
-                    if (!isNonEmptyString(rawWorkspace.name)) {
+                    if (!isNonEmptyString(rawWorkspace.name)
+                            || rawWorkspace.name.length > MAX_NAME_LENGTH) {
                         errors.push(makeDiagnostic("name-invalid", wScope + ".name",
                             "Workspace name must be a non-empty string."));
                     } else {
@@ -764,6 +857,16 @@ function parseRepositoriesConfig(text, homeDirectory) {
         notifications: false, openOnReady: false,
     };
 
+    if (!isString(text) || utf8ByteLength(text) > MAX_CONFIG_BYTES) {
+        errors.push(makeDiagnostic("config-too-large", "config",
+            "Configuration exceeds the 16384-byte limit."));
+        return result;
+    }
+    if (!jsonDepthWithinLimit(text, MAX_JSON_DEPTH)) {
+        errors.push(makeDiagnostic("config-too-deep", "config",
+            "Configuration exceeds the JSON depth limit of 12."));
+        return result;
+    }
     var root;
     try {
         root = JSON.parse(text);
@@ -803,6 +906,11 @@ function parseRepositoriesConfig(text, homeDirectory) {
     if (!Array.isArray(root.repositories)) {
         errors.push(makeDiagnostic("config-repositories-required", "repositories",
             "Configuration requires a \"repositories\" array."));
+        return result;
+    }
+    if (root.repositories.length > 16) {
+        errors.push(makeDiagnostic("config-repositories-limit", "repositories",
+            "Configuration permits at most 16 repositories."));
         return result;
     }
     var seen = {};
@@ -947,7 +1055,8 @@ function canStart(project, statusesByID) {
 // status below 500 counts as ready (a 404 still proves the port answered).
 function curlProbeArgv(url) {
     return [
-        "curl", "-s", "-o", "/dev/null", "-I",
+        "curl", "-q", "--noproxy", "*", "--proto", "=http,https",
+        "-s", "-o", "/dev/null", "-I",
         "-w", "%{http_code}",
         "--max-time", String(PROBE_TIMEOUT_SECONDS),
         url,
@@ -966,7 +1075,9 @@ function appendOutputTail(existing, chunk, maxLines) {
     var lines = existing.concat(String(chunk).split(/\r?\n/));
     var kept = [];
     for (var i = 0; i < lines.length; i += 1) {
-        if (lines[i] !== "") { kept.push(lines[i]); }
+        if (lines[i] !== "") {
+            kept.push(lines[i].slice(0, MAX_OUTPUT_LINE_LENGTH));
+        }
     }
     if (kept.length > maxLines) {
         kept = kept.slice(kept.length - maxLines);
@@ -1159,7 +1270,7 @@ function notificationForTransition(name, status, detail) {
 }
 
 function notifySendArgv(summary, body) {
-    var argv = ["notify-send", "-a", "LocalWrap", summary];
+    var argv = ["notify-send", "-a", "LocalWrap", "--", summary];
     if (isNonEmptyString(body)) { argv.push(body); }
     return argv;
 }
