@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ctypes
+import fcntl
 import json
 import os
 import selectors
@@ -59,6 +61,28 @@ CONFIG_FIELDS = {"repositories", "notifications", "openOnReady"}
 LOOPBACK_HOSTS = {"127.0.0.1", "::1"}
 ALLOWED_EXECUTABLES = {"npm", "pnpm", "yarn", "bun", "node", "python", "python3"}
 FORBIDDEN_COMMAND_CHARS = set(";&|$`><(){}[]!#*?~%^\"'\r\n")
+PYTHON_SNAPSHOT_BOOTSTRAP = (
+    "import os,sys;"
+    "p=os.environ['LOCALWRAP_SCRIPT_PATH'];"
+    "fd=int(os.environ['LOCALWRAP_SCRIPT_FD']);"
+    "os.lseek(fd,0,0);data=os.read(fd,1048577);"
+    "sys.argv=[p,*sys.argv[1:]];sys.path[0]=os.path.dirname(p);"
+    "ns={'__name__':'__main__','__file__':p,'__package__':None,'__cached__':None};"
+    "exec(compile(data,p,'exec'),ns,ns)"
+)
+NODE_SNAPSHOT_BOOTSTRAP = (
+    "const fs=require('fs'),Module=require('module');"
+    "const p=process.env.LOCALWRAP_SCRIPT_PATH,fd=Number(process.env.LOCALWRAP_SCRIPT_FD);"
+    "const m=new Module(p);m.filename=p;m.paths=Module._nodeModulePaths(require('path').dirname(p));"
+    "process.argv=[process.execPath,p,...process.argv.slice(1)];m._compile(fs.readFileSync(fd,'utf8'),p);"
+)
+RENAME_NOREPLACE = 1
+RENAME_EXCHANGE = 2
+F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", 1033)
+F_SEAL_SEAL = getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+F_SEAL_SHRINK = getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+F_SEAL_GROW = getattr(fcntl, "F_SEAL_GROW", 0x0004)
+F_SEAL_WRITE = getattr(fcntl, "F_SEAL_WRITE", 0x0008)
 
 
 class LocalWrapError(Exception):
@@ -76,10 +100,18 @@ def diagnostic(code: str, scope: str, message: str) -> dict[str, str]:
     return {"code": code, "scope": scope, "message": message}
 
 
-def read_bounded(path: Path, limit: int, label: str) -> bytes:
+def read_bounded_fd(descriptor: int, limit: int, label: str) -> bytes:
     try:
-        with path.open("rb") as handle:
-            data = handle.read(limit + 1)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        total = 0
+        while total <= limit:
+            chunk = os.read(descriptor, min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        data = b"".join(chunks)
     except OSError as exc:
         raise LocalWrapError(f"cannot read {label}: {exc.strerror or exc}") from exc
     if len(data) > limit:
@@ -89,8 +121,21 @@ def read_bounded(path: Path, limit: int, label: str) -> bytes:
     return data
 
 
-def file_digest(path: Path, limit: int, label: str) -> str:
-    return hashlib.sha256(read_bounded(path, limit, label)).hexdigest()
+def read_bounded(path: Path, limit: int, label: str) -> bytes:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise LocalWrapError(f"cannot read {label}: {exc.strerror or exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise LocalWrapError(f"{label} is not a regular file")
+        return read_bounded_fd(descriptor, limit, label)
+    finally:
+        os.close(descriptor)
+
+
+def bytes_digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
 
 
 def json_depth(raw: bytes) -> int:
@@ -120,14 +165,88 @@ def json_depth(raw: bytes) -> int:
     return maximum
 
 
-def load_json(path: Path, limit: int, label: str) -> Any:
-    raw = read_bounded(path, limit, label)
+def decode_json(raw: bytes, label: str) -> Any:
     if json_depth(raw) > MAX_JSON_DEPTH:
         raise LocalWrapError(f"{label} exceeds the JSON depth limit of {MAX_JSON_DEPTH}")
     try:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise LocalWrapError(f"{label} is not valid UTF-8 JSON: {exc}") from exc
+
+
+def load_json(path: Path, limit: int, label: str) -> Any:
+    return decode_json(read_bounded(path, limit, label), label)
+
+
+def fd_identity(descriptor: int) -> dict[str, int]:
+    details = os.fstat(descriptor)
+    return {"device": details.st_dev, "inode": details.st_ino}
+
+
+def fd_display_path(descriptor: int) -> str:
+    return os.readlink(f"/proc/self/fd/{descriptor}").removesuffix(" (deleted)")
+
+
+def relative_parts(relative: str, scope: str) -> list[str]:
+    value = ensure_string(relative, scope, MAX_PATH)
+    path = Path(value)
+    if path.is_absolute():
+        raise LocalWrapError(f"{scope} must be relative to the repository")
+    parts = [part for part in path.parts if part != "."]
+    if any(part in {"", ".."} for part in parts):
+        raise LocalWrapError(f"{scope} must not traverse outside its base directory")
+    return parts
+
+
+def open_relative_fd(base_descriptor: int, relative: str, scope: str, *, directory: bool) -> int:
+    parts = relative_parts(relative, scope)
+    current = os.dup(base_descriptor)
+    try:
+        for index, part in enumerate(parts):
+            final = index == len(parts) - 1
+            flags = os.O_CLOEXEC | os.O_NOFOLLOW
+            flags |= os.O_RDONLY
+            if not final or directory:
+                flags |= os.O_DIRECTORY
+            next_descriptor = os.open(part, flags, dir_fd=current)
+            details = os.fstat(next_descriptor)
+            expected = stat.S_ISDIR(details.st_mode) if (not final or directory) else stat.S_ISREG(details.st_mode)
+            if not expected:
+                os.close(next_descriptor)
+                kind = "directory" if (not final or directory) else "regular file"
+                raise LocalWrapError(f"{scope} must resolve to a {kind}")
+            os.close(current)
+            current = next_descriptor
+        if not parts and not directory:
+            raise LocalWrapError(f"{scope} must name a regular file")
+        return current
+    except OSError as exc:
+        os.close(current)
+        raise LocalWrapError(f"{scope} cannot be opened without following links: {exc.strerror or exc}") from exc
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def sealed_snapshot(raw: bytes, label: str) -> int:
+    try:
+        descriptor = os.memfd_create(f"localwrap-{label}", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+        offset = 0
+        while offset < len(raw):
+            offset += os.write(descriptor, raw[offset:])
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        fcntl.fcntl(
+            descriptor,
+            F_ADD_SEALS,
+            F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL,
+        )
+        return descriptor
+    except (AttributeError, OSError) as exc:
+        try:
+            os.close(descriptor)
+        except (NameError, OSError):
+            pass
+        raise LocalWrapError(f"cannot create immutable {label} snapshot: {exc}") from exc
 
 
 def ensure_string(value: Any, scope: str, maximum: int, *, nonempty: bool = True) -> str:
@@ -288,9 +407,12 @@ def parse_command(command: Any) -> list[str]:
     return argv
 
 
-def parse_manifest(root: Path) -> tuple[Path, dict[str, Any]]:
-    path = manifest_file(root)
-    document = load_json(path, MAX_MANIFEST_BYTES, "workspace manifest")
+def parse_manifest_document(
+    root: Path,
+    path: Path,
+    document: Any,
+    directory_resolver: Any = contained_path,
+) -> dict[str, Any]:
     manifest = ensure_object(document, "manifest", ROOT_FIELDS)
     if manifest.get("localwrap") != 1:
         raise LocalWrapError('manifest requires "localwrap": 1')
@@ -311,7 +433,7 @@ def parse_manifest(root: Path) -> tuple[Path, dict[str, Any]]:
         project_name = ensure_string(raw.get("name", explicit_id or f"Project {index + 1}"), f"{scope}.name", MAX_NAME)
         project_id = unique_slug(explicit_id or project_name or f"project-{index + 1}", used)
         relative = ensure_string(raw.get("path", "."), f"{scope}.path", MAX_PATH)
-        cwd = contained_path(root, relative, f"{scope}.path")
+        cwd = directory_resolver(root, relative, f"{scope}.path")
         argv = parse_command(raw.get("command"))
         port = raw.get("port", 3000)
         if isinstance(port, bool) or not isinstance(port, int) or not 1000 <= port <= 65535:
@@ -402,7 +524,40 @@ def parse_manifest(root: Path) -> tuple[Path, dict[str, Any]]:
             "id": unique_slug(explicit_id or workspace_name, workspace_used),
             "name": workspace_name, "projects": member_ids,
         })
-    return path, {"name": name, "projects": projects, "workspaces": workspaces}
+    return {"name": name, "projects": projects, "workspaces": workspaces}
+
+
+def parse_manifest(root: Path) -> tuple[Path, dict[str, Any]]:
+    path = manifest_file(root)
+    raw = read_bounded(path, MAX_MANIFEST_BYTES, "workspace manifest")
+    document = decode_json(raw, "workspace manifest")
+    return path, parse_manifest_document(root, path, document)
+
+
+def manifest_snapshot(
+    root: Path,
+    root_descriptor: int,
+    directory_resolver: Any = contained_path,
+) -> tuple[Path, bytes, dict[str, Any]]:
+    last_error: LocalWrapError | None = None
+    for relative in MANIFESTS:
+        try:
+            descriptor = open_relative_fd(
+                root_descriptor, relative, f"manifest {relative}", directory=False
+            )
+        except LocalWrapError as exc:
+            last_error = exc
+            continue
+        try:
+            raw = read_bounded_fd(descriptor, MAX_MANIFEST_BYTES, "workspace manifest")
+        finally:
+            os.close(descriptor)
+        path = root / relative
+        document = decode_json(raw, "workspace manifest")
+        return path, raw, parse_manifest_document(root, path, document, directory_resolver)
+    if last_error is not None and "No such file" not in str(last_error):
+        raise last_error
+    raise LocalWrapError("no .localwrap/workspace.json or localwrap.json found")
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -450,11 +605,219 @@ def atomic_write_json(path: Path, value: Any) -> None:
         raise
 
 
-def package_script(cwd: Path, argv: list[str]) -> tuple[Path, str, list[dict[str, str]]]:
-    package_path = cwd / "package.json"
-    if package_path.is_symlink():
-        raise LocalWrapError("package.json must not be a symlink")
-    document = load_json(package_path, MAX_PACKAGE_BYTES, "package.json")
+def renameat2(
+    old_directory: int, old_name: str, new_directory: int, new_name: str, flags: int
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = getattr(libc, "renameat2", None)
+    if function is None:
+        raise LocalWrapError("this system does not provide race-safe renameat2 installation")
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    result = function(
+        old_directory, os.fsencode(old_name), new_directory, os.fsencode(new_name), flags
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def entry_identity(directory: int, name: str) -> dict[str, int] | None:
+    try:
+        details = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return {"device": details.st_dev, "inode": details.st_ino}
+
+
+def open_owned_install_parent(target_parent: Path) -> int:
+    home_text = os.environ.get("HOME")
+    if not home_text:
+        raise LocalWrapError("HOME is required for installation")
+    home = Path(home_text)
+    if not home.is_absolute():
+        raise LocalWrapError("HOME must be absolute")
+    expected = home / ".config" / "omarchy" / "plugins"
+    if target_parent != expected:
+        raise LocalWrapError(f"installation parent must be exactly {expected}")
+    descriptor = os.open("/", os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+    try:
+        for part in home.parts[1:]:
+            next_descriptor = os.open(
+                part,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        if os.fstat(descriptor).st_uid != os.getuid():
+            raise LocalWrapError("HOME must be owned by the installing user")
+        for part in (".config", "omarchy", "plugins"):
+            next_descriptor = os.open(
+                part,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                dir_fd=descriptor,
+            )
+            if os.fstat(next_descriptor).st_uid != os.getuid():
+                os.close(next_descriptor)
+                raise LocalWrapError(f"installation ancestor {part} is not owned by the installing user")
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except OSError as exc:
+        os.close(descriptor)
+        raise LocalWrapError(f"installation ancestors must be real directories: {exc.strerror or exc}") from exc
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def verify_owned_plugin(directory_descriptor: int) -> None:
+    if os.fstat(directory_descriptor).st_uid != os.getuid():
+        raise LocalWrapError("installed plugin directory is not owned by the installing user")
+    manifest_descriptor = open_relative_fd(
+        directory_descriptor, "manifest.json", "installed manifest", directory=False
+    )
+    try:
+        raw = read_bounded_fd(manifest_descriptor, MAX_MANIFEST_BYTES, "installed manifest")
+    finally:
+        os.close(manifest_descriptor)
+    document = decode_json(raw, "installed manifest")
+    if not isinstance(document, dict) or document.get("id") != "io.github.tcballard.localwrap":
+        raise LocalWrapError("refusing to replace a directory not owned by LocalWrap")
+
+
+def remove_tree_contents(directory_descriptor: int) -> None:
+    with os.scandir(directory_descriptor) as entries:
+        for entry in entries:
+            details = entry.stat(follow_symlinks=False)
+            if stat.S_ISDIR(details.st_mode):
+                child = os.open(
+                    entry.name,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                    dir_fd=directory_descriptor,
+                )
+                try:
+                    if fd_identity(child) != {"device": details.st_dev, "inode": details.st_ino}:
+                        raise LocalWrapError("retired installation changed during cleanup")
+                    remove_tree_contents(child)
+                finally:
+                    os.close(child)
+                os.rmdir(entry.name, dir_fd=directory_descriptor)
+            else:
+                os.unlink(entry.name, dir_fd=directory_descriptor)
+
+
+def command_install_swap(staging: str, target: str, force: str) -> None:
+    staging_path = Path(staging)
+    target_path = Path(target)
+    if not staging_path.is_absolute() or not target_path.is_absolute():
+        raise LocalWrapError("installer paths must be absolute")
+    if staging_path.parent != target_path.parent:
+        raise LocalWrapError("staging and target must share one verified parent")
+    if force not in {"0", "1"}:
+        raise LocalWrapError("installer force flag must be 0 or 1")
+    parent_descriptor = open_owned_install_parent(target_path.parent)
+    lock_descriptor = -1
+    staging_descriptor = -1
+    target_descriptor = -1
+    try:
+        lock_descriptor = os.open(
+            ".io.github.tcballard.localwrap.install.lock",
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        lock_details = os.fstat(lock_descriptor)
+        if not stat.S_ISREG(lock_details.st_mode) or lock_details.st_uid != os.getuid():
+            raise LocalWrapError("installer lock is not a user-owned regular file")
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        staging_descriptor = os.open(
+            staging_path.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+            dir_fd=parent_descriptor,
+        )
+        if os.fstat(staging_descriptor).st_uid != os.getuid():
+            raise LocalWrapError("staging directory is not owned by the installing user")
+        staging_identity = fd_identity(staging_descriptor)
+        target_identity = entry_identity(parent_descriptor, target_path.name)
+        if target_identity is None:
+            try:
+                renameat2(
+                    parent_descriptor, staging_path.name,
+                    parent_descriptor, target_path.name,
+                    RENAME_NOREPLACE,
+                )
+            except FileExistsError as exc:
+                raise LocalWrapError("destination appeared during install; no files were displaced") from exc
+            if entry_identity(parent_descriptor, target_path.name) != staging_identity:
+                raise LocalWrapError("installed target identity changed during no-replace swap")
+        else:
+            if force != "1":
+                raise LocalWrapError(f"already installed at {target_path}; re-run with --force")
+            target_descriptor = os.open(
+                target_path.name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                dir_fd=parent_descriptor,
+            )
+            verify_owned_plugin(target_descriptor)
+            held_target_identity = fd_identity(target_descriptor)
+            if held_target_identity != target_identity:
+                raise LocalWrapError("installed target changed before the locked swap")
+            renameat2(
+                parent_descriptor, staging_path.name,
+                parent_descriptor, target_path.name,
+                RENAME_EXCHANGE,
+            )
+            target_after = entry_identity(parent_descriptor, target_path.name)
+            displaced_after = entry_identity(parent_descriptor, staging_path.name)
+            if target_after != staging_identity or displaced_after != held_target_identity:
+                # Exchange is its own exact inverse. Only attempt rollback while
+                # both names still identify the objects from our transaction.
+                if displaced_after == held_target_identity:
+                    renameat2(
+                        parent_descriptor, staging_path.name,
+                        parent_descriptor, target_path.name,
+                        RENAME_EXCHANGE,
+                    )
+                restored = entry_identity(parent_descriptor, target_path.name)
+                if restored != held_target_identity:
+                    raise LocalWrapError("swap was displaced and the prior installation could not be restored")
+                raise LocalWrapError("swap verification failed; the prior installation was restored")
+        os.fsync(parent_descriptor)
+        backup: str | None = None
+        if target_identity is not None:
+            try:
+                remove_tree_contents(target_descriptor)
+                if entry_identity(parent_descriptor, staging_path.name) != held_target_identity:
+                    raise LocalWrapError("retired installation name changed before removal")
+                os.rmdir(staging_path.name, dir_fd=parent_descriptor)
+                os.fsync(parent_descriptor)
+            except (OSError, LocalWrapError):
+                # The new exact target is already verified. Never chase or
+                # delete a displaced name; retain it for manual inspection.
+                backup = str(staging_path)
+        emit({"ok": True, "target": str(target_path), "backup": backup})
+    except OSError as exc:
+        raise LocalWrapError(f"race-safe install swap failed: {exc.strerror or exc}") from exc
+    finally:
+        for descriptor in (target_descriptor, staging_descriptor, lock_descriptor, parent_descriptor):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
+def package_script_snapshot(
+    cwd: Path, cwd_descriptor: int, argv: list[str]
+) -> tuple[Path, bytes, str, list[dict[str, str]]]:
+    descriptor = open_relative_fd(cwd_descriptor, "package.json", "package.json", directory=False)
+    try:
+        raw = read_bounded_fd(descriptor, MAX_PACKAGE_BYTES, "package.json")
+    finally:
+        os.close(descriptor)
+    document = decode_json(raw, "package.json")
     if not isinstance(document, dict) or not isinstance(document.get("scripts"), dict):
         raise LocalWrapError("package.json has no scripts object")
     script_name = "start" if argv[0] == "npm" and argv[1] == "start" else argv[2]
@@ -467,60 +830,136 @@ def package_script(cwd: Path, argv: list[str]) -> tuple[Path, str, list[dict[str
             })
     if not any(item["name"] == script_name for item in reviewed):
         raise LocalWrapError(f'package script "{script_name}" is missing')
-    return package_path.resolve(strict=True), script_name, reviewed
+    return cwd / "package.json", raw, script_name, reviewed
+
+
+def open_executable(command: str) -> tuple[Path, int]:
+    executable = shutil.which(command)
+    if executable is None:
+        raise LocalWrapError(f'executable "{command}" was not found on PATH')
+    try:
+        path = Path(executable).resolve(strict=True)
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise LocalWrapError(f'executable "{command}" cannot be pinned: {exc.strerror or exc}') from exc
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise LocalWrapError("resolved executable is not a regular file")
+    return path, descriptor
+
+
+def close_prepared(prepared: dict[str, Any]) -> None:
+    for descriptor in prepared.get("descriptors", []):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    prepared["descriptors"] = []
+
+
+def prepare_launch(root: Path, project_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    root_descriptor = os.open(root, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY)
+    prepared: dict[str, Any] = {"descriptors": [root_descriptor]}
+    try:
+        def validate_directory(_root: Path, relative: str, scope: str) -> Path:
+            descriptor = open_relative_fd(root_descriptor, relative, scope, directory=True)
+            try:
+                return Path(fd_display_path(descriptor))
+            finally:
+                os.close(descriptor)
+
+        manifest_path, manifest_raw, manifest = manifest_snapshot(
+            root, root_descriptor, validate_directory
+        )
+        project = next((item for item in manifest["projects"] if item["id"] == project_id), None)
+        if project is None:
+            raise LocalWrapError(f'project "{project_id}" is not in the current manifest')
+        argv = parse_command(project["commandLine"])
+        cwd_descriptor = open_relative_fd(
+            root_descriptor, project["path"], "project directory", directory=True
+        )
+        prepared["descriptors"].append(cwd_descriptor)
+        cwd = Path(fd_display_path(cwd_descriptor))
+        origins = [{
+            "kind": "manifest", "path": str(manifest_path),
+            "sha256": bytes_digest(manifest_raw),
+        }]
+        review_detail = ""
+        package_launchers = {"npm", "pnpm", "yarn", "bun"}
+        if argv[0] in package_launchers:
+            requested_path, requested_descriptor = open_executable(argv[0])
+            os.close(requested_descriptor)
+            shell_path, executable_descriptor = open_executable("sh")
+            prepared["descriptors"].append(executable_descriptor)
+            package_path, package_raw, script_name, scripts = package_script_snapshot(
+                cwd, cwd_descriptor, argv
+            )
+            origins.append({
+                "kind": "package-script", "path": str(package_path), "name": script_name,
+                "scripts": scripts, "sha256": bytes_digest(package_raw),
+            })
+            review_detail = (
+                f"Held package snapshot: {package_path} (sha256 {origins[-1]['sha256']})"
+                f"\nRequested launcher: {requested_path}"
+                f"\nExecution: {shell_path} -c each exact reviewed lifecycle string"
+            )
+            for item in scripts:
+                review_detail += f"\n{item['name']}: {item['value']}"
+            prepared.update({"kind": "package", "steps": scripts})
+            execution_argv = [[str(shell_path), "-c", item["value"]] for item in scripts]
+            executable_path = shell_path
+        else:
+            executable_path, executable_descriptor = open_executable(argv[0])
+            prepared["descriptors"].append(executable_descriptor)
+            script_descriptor = open_relative_fd(
+                cwd_descriptor, argv[1], "interpreter script", directory=False
+            )
+            try:
+                script_raw = read_bounded_fd(script_descriptor, MAX_SCRIPT_BYTES, "interpreter script")
+                script_identity = fd_identity(script_descriptor)
+            finally:
+                os.close(script_descriptor)
+            immutable_script = sealed_snapshot(script_raw, "script")
+            prepared["descriptors"].append(immutable_script)
+            script_path = cwd / argv[1]
+            origins.append({
+                "kind": "script", "path": str(script_path),
+                "sha256": bytes_digest(script_raw), "identity": script_identity,
+            })
+            review_detail = (
+                f"Immutable local script snapshot: {script_path}"
+                f"\nsha256: {origins[-1]['sha256']}"
+            )
+            prepared.update({
+                "kind": "interpreter", "interpreter": argv[0],
+                "scriptDescriptor": immutable_script, "scriptPath": str(script_path),
+                "tail": argv[2:],
+            })
+            execution_argv = [[str(executable_path), "<sealed-script-snapshot>", *argv[2:]]]
+
+        executable_descriptor = prepared["descriptors"][-2 if prepared["kind"] == "interpreter" else -1]
+        core = {
+            "repository": str(root), "projectId": project["id"], "projectName": project["name"],
+            "cwd": str(cwd), "cwdIdentity": fd_identity(cwd_descriptor),
+            "executable": str(executable_path),
+            "executableIdentity": fd_identity(executable_descriptor),
+            "argv": execution_argv, "displayCommand": project["commandLine"],
+            "port": project["port"], "origins": origins, "reviewDetail": review_detail,
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(core, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        prepared["executableDescriptor"] = executable_descriptor
+        return {**core, "fingerprint": fingerprint}, prepared
+    except BaseException:
+        close_prepared(prepared)
+        raise
 
 
 def launch_plan(root: Path, project_id: str) -> dict[str, Any]:
-    manifest_path, manifest = parse_manifest(root)
-    project = next((item for item in manifest["projects"] if item["id"] == project_id), None)
-    if project is None:
-        raise LocalWrapError(f'project "{project_id}" is not in the current manifest')
-    argv = parse_command(project["commandLine"])
-    executable = shutil.which(argv[0])
-    if executable is None:
-        raise LocalWrapError(f'executable "{argv[0]}" was not found on PATH')
-    executable_path = Path(executable).resolve(strict=True)
-    if not executable_path.is_file():
-        raise LocalWrapError("resolved executable is not a regular file")
-    cwd = real_directory(Path(project["cwd"]), "project directory")
-    if not is_within(cwd, root):
-        raise LocalWrapError("project directory resolves outside the repository")
-    origins = [{
-        "kind": "manifest", "path": str(manifest_path),
-        "sha256": file_digest(manifest_path, MAX_MANIFEST_BYTES, "workspace manifest"),
-    }]
-    review_detail = "Repository-contained script"
-    if argv[0] in {"npm", "pnpm", "yarn", "bun"}:
-        package_path, script_name, scripts = package_script(cwd, argv)
-        if not is_within(package_path, root):
-            raise LocalWrapError("package.json resolves outside the repository")
-        origins.append({
-            "kind": "package-script", "path": str(package_path), "name": script_name,
-            "scripts": scripts,
-            "sha256": file_digest(package_path, MAX_PACKAGE_BYTES, "package.json"),
-        })
-        review_detail = f"{package_path} (sha256 {origins[-1]['sha256']})"
-        for item in scripts:
-            review_detail += f"\n{item['name']}: {item['value']}"
-    else:
-        script_path = contained_path(cwd, argv[1], "interpreter script", file_required=True)
-        if not is_within(script_path, root):
-            raise LocalWrapError("interpreter script resolves outside the repository")
-        origins.append({
-            "kind": "script", "path": str(script_path),
-            "sha256": file_digest(script_path, MAX_SCRIPT_BYTES, "interpreter script"),
-        })
-        review_detail = f"Local script: {script_path}\nsha256: {origins[-1]['sha256']}"
-    core = {
-        "repository": str(root), "projectId": project["id"], "projectName": project["name"],
-        "cwd": str(cwd), "executable": str(executable_path),
-        "argv": [str(executable_path)] + argv[1:], "displayCommand": project["commandLine"],
-        "port": project["port"], "origins": origins, "reviewDetail": review_detail,
-    }
-    fingerprint = hashlib.sha256(
-        json.dumps(core, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    return {**core, "fingerprint": fingerprint}
+    plan, prepared = prepare_launch(root, project_id)
+    close_prepared(prepared)
+    return plan
 
 
 ACTIVE_CHILD: subprocess.Popen[bytes] | None = None
@@ -558,7 +997,7 @@ def signal_cleanup(_signum: int, _frame: Any) -> None:
     raise SystemExit(143)
 
 
-def forward_bounded(child: subprocess.Popen[bytes]) -> int:
+def forward_bounded(child: subprocess.Popen[bytes], budget: int = MAX_FORWARDED_OUTPUT) -> tuple[int, int]:
     selector = selectors.DefaultSelector()
     assert child.stdout is not None and child.stderr is not None
     for stream in (child.stdout, child.stderr):
@@ -583,11 +1022,11 @@ def forward_bounded(child: subprocess.Popen[bytes]) -> int:
             # helper's own pending buffer even though forwarded output is capped.
             pending[stream] = parts.pop()[:MAX_OUTPUT_LINE]
             for line in parts:
-                if forwarded >= MAX_FORWARDED_OUTPUT:
+                if forwarded >= budget:
                     continue
                 safe = line[:MAX_OUTPUT_LINE].decode("utf-8", "replace")
                 encoded = (safe + "\n").encode("utf-8")
-                remaining = MAX_FORWARDED_OUTPUT - forwarded
+                remaining = budget - forwarded
                 encoded = encoded[:remaining]
                 sys.stdout.buffer.write(encoded)
                 sys.stdout.buffer.flush()
@@ -595,12 +1034,17 @@ def forward_bounded(child: subprocess.Popen[bytes]) -> int:
         if child.poll() is not None and not selector.get_map():
             break
     for data in pending.values():
-        if data and forwarded < MAX_FORWARDED_OUTPUT:
+        if data and forwarded < budget:
             safe = data[:MAX_OUTPUT_LINE].decode("utf-8", "replace")
-            encoded = (safe + "\n").encode("utf-8")[: MAX_FORWARDED_OUTPUT - forwarded]
+            encoded = (safe + "\n").encode("utf-8")[: budget - forwarded]
             sys.stdout.buffer.write(encoded)
             sys.stdout.buffer.flush()
-    return child.wait()
+            forwarded += len(encoded)
+    code = child.wait()
+    selector.close()
+    child.stdout.close()
+    child.stderr.close()
+    return code, forwarded
 
 
 def command_inspect(repository: str) -> None:
@@ -619,20 +1063,56 @@ def command_inspect(repository: str) -> None:
 def command_run(repository: str, project_id: str, fingerprint: str) -> None:
     global ACTIVE_CHILD
     root = resolve_repository(repository)
-    plan = launch_plan(root, project_id)
-    if not hmac.compare_digest(plan["fingerprint"], fingerprint):
-        raise LocalWrapError("launch details changed after review; review and confirm again")
-    environment = dict(os.environ)
-    environment["PORT"] = str(plan["port"])
-    ACTIVE_CHILD = subprocess.Popen(
-        plan["argv"], cwd=plan["cwd"], env=environment,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
-    )
+    plan, prepared = prepare_launch(root, project_id)
     try:
-        code = forward_bounded(ACTIVE_CHILD)
+        if not hmac.compare_digest(plan["fingerprint"], fingerprint):
+            raise LocalWrapError("launch details changed after review; review and confirm again")
+        environment = dict(os.environ)
+        environment["PORT"] = str(plan["port"])
+        cwd_descriptor = prepared["descriptors"][1]
+        executable_descriptor = prepared["executableDescriptor"]
+        cwd_argument = f"/proc/self/fd/{cwd_descriptor}"
+        executable_argument = f"/proc/self/fd/{executable_descriptor}"
+        pass_descriptors = tuple(prepared["descriptors"][1:])
+        forwarded = 0
+        code = 0
+        if prepared["kind"] == "interpreter":
+            script_descriptor = prepared["scriptDescriptor"]
+            environment["LOCALWRAP_SCRIPT_FD"] = str(script_descriptor)
+            environment["LOCALWRAP_SCRIPT_PATH"] = prepared["scriptPath"]
+            if prepared["interpreter"] == "node":
+                argv = [plan["executable"], "-e", NODE_SNAPSHOT_BOOTSTRAP, *prepared["tail"]]
+            else:
+                argv = [plan["executable"], "-c", PYTHON_SNAPSHOT_BOOTSTRAP, *prepared["tail"]]
+            ACTIVE_CHILD = subprocess.Popen(
+                argv, executable=executable_argument, cwd=cwd_argument, env=environment,
+                pass_fds=pass_descriptors, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            code, _used = forward_bounded(ACTIVE_CHILD)
+        else:
+            environment["PATH"] = f"{cwd_argument}/node_modules/.bin:{environment.get('PATH', '')}"
+            for item in prepared["steps"]:
+                environment["npm_lifecycle_event"] = item["name"]
+                ACTIVE_CHILD = subprocess.Popen(
+                    [plan["executable"], "-c", item["value"]],
+                    executable=executable_argument, cwd=cwd_argument, env=environment,
+                    pass_fds=pass_descriptors, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+                code, used = forward_bounded(
+                    ACTIVE_CHILD, max(0, MAX_FORWARDED_OUTPUT - forwarded)
+                )
+                forwarded += used
+                terminate_group(ACTIVE_CHILD)
+                ACTIVE_CHILD = None
+                if code != 0:
+                    break
     finally:
-        terminate_group(ACTIVE_CHILD)
+        if ACTIVE_CHILD is not None:
+            terminate_group(ACTIVE_CHILD)
         ACTIVE_CHILD = None
+        close_prepared(prepared)
     raise SystemExit(code)
 
 
@@ -665,6 +1145,8 @@ def main(argv: list[str]) -> None:
         emit({"ok": True, **launch_plan(resolve_repository(argv[2]), argv[3])})
     elif command == "run" and len(argv) == 5:
         command_run(argv[2], argv[3], argv[4])
+    elif command == "install-swap" and len(argv) == 5:
+        command_install_swap(argv[2], argv[3], argv[4])
     else:
         raise LocalWrapError("invalid helper command or argument count")
 
